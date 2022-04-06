@@ -30,6 +30,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "citrusleaf/cf_digest.h"
 #include "citrusleaf/cf_queue.h"
@@ -176,6 +177,13 @@ static const as_storage_activate_fn as_storage_activate_table[AS_NUM_STORAGE_ENG
 	as_storage_activate_ssd
 };
 
+typedef bool (*as_storage_wait_for_defrag_fn)(as_namespace *ns);
+static const as_storage_wait_for_defrag_fn as_storage_wait_for_defrag_table[AS_NUM_STORAGE_ENGINES] = {
+	NULL, // memory doesn't do defrag
+	as_storage_wait_for_defrag_pmem,
+	as_storage_wait_for_defrag_ssd
+};
+
 void
 as_storage_activate()
 {
@@ -185,6 +193,25 @@ as_storage_activate()
 		if (as_storage_activate_table[ns->storage_type]) {
 			as_storage_activate_table[ns->storage_type](ns);
 		}
+	}
+
+	while (true) {
+		bool any_defragging = false;
+
+		for (uint32_t ns_ix = 0; ns_ix < g_config.n_namespaces; ns_ix++) {
+			as_namespace *ns = g_config.namespaces[ns_ix];
+
+			if (as_storage_wait_for_defrag_table[ns->storage_type] &&
+					as_storage_wait_for_defrag_table[ns->storage_type](ns)) {
+				any_defragging = true;
+			}
+		}
+
+		if (! any_defragging) {
+			break;
+		}
+
+		sleep(3);
 	}
 }
 
@@ -459,33 +486,10 @@ as_storage_record_write(as_storage_rd *rd)
 }
 
 //--------------------------------------
-// as_storage_wait_for_defrag
-//
-
-typedef void (*as_storage_wait_for_defrag_fn)(as_namespace *ns);
-static const as_storage_wait_for_defrag_fn as_storage_wait_for_defrag_table[AS_NUM_STORAGE_ENGINES] = {
-	NULL, // memory doesn't do defrag
-	as_storage_wait_for_defrag_pmem,
-	as_storage_wait_for_defrag_ssd
-};
-
-void
-as_storage_wait_for_defrag()
-{
-	for (uint32_t ns_ix = 0; ns_ix < g_config.n_namespaces; ns_ix++) {
-		as_namespace *ns = g_config.namespaces[ns_ix];
-
-		if (as_storage_wait_for_defrag_table[ns->storage_type]) {
-			as_storage_wait_for_defrag_table[ns->storage_type](ns);
-		}
-	}
-}
-
-//--------------------------------------
 // as_storage_overloaded
 //
 
-typedef bool (*as_storage_overloaded_fn)(const as_namespace *ns);
+typedef bool (*as_storage_overloaded_fn)(const as_namespace *ns, uint32_t margin, const char* tag);
 static const as_storage_overloaded_fn as_storage_overloaded_table[AS_NUM_STORAGE_ENGINES] = {
 	NULL, // memory has no overload check
 	as_storage_overloaded_pmem,
@@ -493,10 +497,10 @@ static const as_storage_overloaded_fn as_storage_overloaded_table[AS_NUM_STORAGE
 };
 
 bool
-as_storage_overloaded(const as_namespace *ns)
+as_storage_overloaded(const as_namespace *ns, uint32_t margin, const char* tag)
 {
 	if (as_storage_overloaded_table[ns->storage_type]) {
-		return as_storage_overloaded_table[ns->storage_type](ns);
+		return as_storage_overloaded_table[ns->storage_type](ns, margin, tag);
 	}
 
 	return false;

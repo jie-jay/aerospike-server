@@ -85,6 +85,12 @@ as_storage_activate_pmem(as_namespace* ns)
 	pmem_crash_ce();
 }
 
+bool
+as_storage_wait_for_defrag_pmem(as_namespace* ns)
+{
+	pmem_crash_ce();
+}
+
 void
 as_storage_start_tomb_raider_pmem(as_namespace* ns)
 {
@@ -145,14 +151,9 @@ as_storage_record_write_pmem(as_storage_rd* rd)
 	pmem_crash_ce();
 }
 
-void
-as_storage_wait_for_defrag_pmem(as_namespace* ns)
-{
-	pmem_crash_ce();
-}
-
 bool
-as_storage_overloaded_pmem(const as_namespace* ns)
+as_storage_overloaded_pmem(const as_namespace* ns, uint32_t margin,
+		const char* tag)
 {
 	pmem_crash_ce();
 }

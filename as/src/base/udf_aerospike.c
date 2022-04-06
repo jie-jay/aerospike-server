@@ -156,12 +156,6 @@ udf_aerospike_rec_create(const as_aerospike* as, const as_rec* rec)
 		// If it's an expired or truncated record, pretend it's a fresh create.
 		if (as_record_is_doomed(r, ns)) {
 			as_set_index_delete_live(ns, tree, r, r_ref->r_h);
-
-			if (record_has_sindex(r, ns)) {
-				// Pessimistic, but not (yet) worth the full check.
-				tr->flags |= AS_TRANSACTION_FLAG_SINDEX_TOUCHED;
-			}
-
 			as_record_rescue(r_ref, ns);
 		}
 		else {
@@ -253,7 +247,7 @@ udf_aerospike_rec_exists(const as_aerospike* as, const as_rec* rec)
 
 	udf_record* urecord = (udf_record*)as_rec_source(rec);
 
-	return urecord->is_open ? 1 : 0;
+	return urecord->is_open && as_record_is_live(urecord->r_ref->r) ? 1 : 0;
 }
 
 //------------------------------------------------
@@ -330,19 +324,17 @@ execute_updates(udf_record* urecord)
 	as_namespace* ns = rd->ns;
 
 	if (! urecord->has_updates) {
-		// Special fast failure case - for this, it's worth it.
-		if (ns->clock_skew_stop_writes) {
-			urecord->result_code = AS_ERR_FORBIDDEN;
-			return -1;
-		}
-
-		// Special fast failure case - for this, it's worth it.
-		if (ns->stop_writes) {
-			urecord->result_code = AS_ERR_OUT_OF_SPACE;
-			return -1;
-		}
-
 		prepare_for_write(urecord);
+	}
+
+	if (ns->clock_skew_stop_writes) {
+		execute_failed(urecord, AS_ERR_FORBIDDEN);
+		return -1;
+	}
+
+	if (ns->stop_writes) {
+		execute_failed(urecord, AS_ERR_OUT_OF_SPACE);
+		return -1;
 	}
 
 	// TODO - bad bin name is just ignored - no equivalent to this.

@@ -90,6 +90,15 @@ cf_memeq(const void* block, uint8_t c, size_t size)
 	return *p == c && memcmp(p, p + 1, size - 1) == 0;
 }
 
+static inline void
+dead_memset(void* block, int c, size_t size)
+{
+	memset(block, c, size);
+
+	// Compiler barrier so memset() can't be optimized out.
+	asm volatile ("" ::: "memory");
+}
+
 // Number of bytes occupied by val converted to a "uintvar".
 static inline uint32_t
 uintvar_size(uint32_t val)

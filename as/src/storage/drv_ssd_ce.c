@@ -62,7 +62,7 @@ ssd_header_init_cfg(const as_namespace* ns, drv_ssd* ssd, drv_header* header)
 
 void
 ssd_header_validate_cfg(const as_namespace* ns, drv_ssd* ssd,
-		const drv_header* header)
+		drv_header* header)
 {
 	if ((header->generic.prefix.flags & DRV_HEADER_FLAG_SINGLE_BIN) != 0) {
 		if (! ns->single_bin) {
@@ -74,6 +74,11 @@ ssd_header_validate_cfg(const as_namespace* ns, drv_ssd* ssd,
 			cf_crash(AS_DRV_SSD, "device has multi-bin data but 'single-bin' is configured");
 		}
 	}
+}
+
+void
+ssd_clear_encryption_keys(as_namespace* ns)
+{
 }
 
 void
@@ -122,6 +127,12 @@ ssd_cold_start_policy(const as_namespace *ns)
 
 void
 ssd_cold_start_init_repl_state(as_namespace* ns, as_record* r)
+{
+	// Nothing to do - relevant for enterprise version only.
+}
+
+void
+ssd_cold_start_set_unrepl_stat(as_namespace* ns)
 {
 	// Nothing to do - relevant for enterprise version only.
 }

@@ -4337,7 +4337,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 	}
 	case AS_CDT_OP_LIST_INCREMENT: {
 		int64_t index;
-		cdt_payload delta = { NULL };
+		cdt_payload delta = { 0 };
 		uint64_t create = AS_PACKED_LIST_FLAG_NONE;
 		uint64_t modify = AS_CDT_LIST_MODIFY_DEFAULT;
 
@@ -4462,7 +4462,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 
 		uint64_t result_type;
 		cdt_payload value_start;
-		cdt_payload value_end = { NULL };
+		cdt_payload value_end = { 0 };
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value_start,
 				&value_end)) {
@@ -4667,7 +4667,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 	case AS_CDT_OP_LIST_GET_BY_VALUE_INTERVAL: {
 		uint64_t result_type;
 		cdt_payload value_start;
-		cdt_payload value_end = { NULL };
+		cdt_payload value_end = { 0 };
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value_start,
 				&value_end)) {

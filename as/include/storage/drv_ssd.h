@@ -38,6 +38,7 @@
 #include "cf_thread.h"
 #include "hist.h"
 #include "log.h"
+#include "pool.h"
 
 #include "base/datamodel.h"
 #include "fabric/partition.h"
@@ -133,8 +134,12 @@ typedef struct drv_ssd_s {
 	cf_mutex		defrag_lock;		// lock protects writes to defrag swb
 	ssd_write_buf	*defrag_swb;		// swb currently being filled by defrag
 
-	cf_queue		*fd_q;				// queue of open fds
-	cf_queue		*fd_cache_q;		// queue of open fds that use page cache
+	cf_pool_int32	fd_pool;			// pool of open fds
+	uint32_t		n_fds;
+
+	cf_pool_int32	fd_cache_pool;		// pool of open fds that use page cache
+	uint32_t		n_cache_fds;
+
 	cf_queue		*shadow_fd_q;		// queue of open fds on shadow, if any
 
 	cf_queue		*free_wblock_q;		// IDs of free wblocks
@@ -213,11 +218,6 @@ typedef struct drv_ssds_s {
 	// Used only at startup, set true if all devices are fresh.
 	bool all_fresh;
 
-	// Used only at startup if building sindexes via device scan.
-	uint64_t si_start_ms;
-	uint32_t si_n_ssds_remaining;
-	uint64_t si_n_recs_read;
-
 	cf_mutex			flush_lock;
 
 	int					n_ssds;
@@ -259,6 +259,7 @@ void ssd_decrypt_whole(drv_ssd *ssd, uint64_t off, uint32_t n_rblocks, struct as
 void ssd_adjust_versions(struct as_namespace_s *ns, drv_pmeta* pmeta);
 conflict_resolution_pol ssd_cold_start_policy(const struct as_namespace_s *ns);
 void ssd_cold_start_init_repl_state(struct as_namespace_s *ns, struct as_index_s* r);
+void ssd_cold_start_set_unrepl_stat(struct as_namespace_s *ns);
 
 // XDR.
 void ssd_cold_start_init_xdr_state(const struct as_flat_record_s* flat, struct as_index_s* r);
@@ -268,7 +269,8 @@ int ssd_fd_get(drv_ssd *ssd);
 int ssd_shadow_fd_get(drv_ssd *ssd);
 void ssd_fd_put(drv_ssd *ssd, int fd);
 void ssd_header_init_cfg(const struct as_namespace_s *ns, drv_ssd* ssd, drv_header *header);
-void ssd_header_validate_cfg(const struct as_namespace_s *ns, drv_ssd* ssd, const drv_header *header);
+void ssd_header_validate_cfg(const struct as_namespace_s *ns, drv_ssd* ssd, drv_header *header);
+void ssd_clear_encryption_keys(struct as_namespace_s *ns);
 void ssd_flush_final_cfg(struct as_namespace_s *ns);
 void ssd_write_header(drv_ssd *ssd, uint8_t *header, uint8_t *from, size_t size);
 void ssd_prefetch_wblock(drv_ssd *ssd, uint64_t file_offset, uint8_t *read_buf);
@@ -279,7 +281,7 @@ uint64_t ssd_flush_max_us(const struct as_namespace_s *ns);
 void ssd_post_write(drv_ssd *ssd, ssd_write_buf *swb);
 int ssd_write_bins(struct as_storage_rd_s *rd);
 int ssd_buffer_bins(struct as_storage_rd_s *rd);
-ssd_write_buf *swb_get(drv_ssd *ssd);
+ssd_write_buf *swb_get(drv_ssd *ssd, bool use_reserve);
 bool write_uses_post_write_q(struct as_storage_rd_s *rd);
 
 // Called in (enterprise-split) storage table function.

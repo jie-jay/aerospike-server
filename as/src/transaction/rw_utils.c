@@ -1,7 +1,7 @@
 /*
  * rw_utils.c
  *
- * Copyright (C) 2016-2020 Aerospike, Inc.
+ * Copyright (C) 2016-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -38,6 +38,7 @@
 #include "log.h"
 #include "msg.h"
 
+#include "base/batch.h"
 #include "base/datamodel.h"
 #include "base/exp.h"
 #include "base/index.h"
@@ -47,6 +48,8 @@
 #include "sindex/secondary_index.h"
 #include "storage/storage.h"
 #include "transaction/rw_request.h"
+#include "transaction/udf.h"
+#include "transaction/write.h"
 
 
 //==========================================================
@@ -153,39 +156,62 @@ set_set_from_msg(as_record* r, as_namespace* ns, as_msg* m)
 
 
 int
-build_predexp_and_filter_meta(const as_transaction* tr, const as_record* r,
-		as_exp** predexp)
+handle_meta_filter(const as_transaction* tr, const as_record* r, as_exp** exp)
 {
-	if (! as_transaction_has_predexp(tr)) {
-		*predexp = NULL;
-		return AS_OK;
+	switch (tr->origin) {
+	case FROM_BATCH:
+		if ((*exp = as_batch_get_predexp(tr->from.batch_shared)) == NULL) {
+			return AS_OK;
+		}
+		break;
+	case FROM_IUDF:
+		*exp = tr->from.iudf_orig->filter_exp;
+		return AS_OK; // meta filter was applied upstream - no need here
+	case FROM_IOPS:
+		*exp = tr->from.iops_orig->filter_exp;
+		return AS_OK; // meta filter was applied upstream - no need here
+	default:
+		if (! as_transaction_has_predexp(tr)) {
+			*exp = NULL;
+			return AS_OK;
+		}
+		as_msg_field* f = as_msg_field_get(&tr->msgp->msg,
+				AS_MSG_FIELD_TYPE_PREDEXP);
+		if ((*exp = as_exp_filter_build(f, false)) == NULL) {
+			return AS_ERR_PARAMETER;
+		}
+		break;
 	}
 
-	as_msg_field* f = as_msg_field_get(&tr->msgp->msg,
-			AS_MSG_FIELD_TYPE_PREDEXP);
+	// TODO - perhaps fields of as_exp_ctx should be const?
+	as_exp_ctx ctx = { .ns = tr->rsv.ns, .r = (as_record*)r };
+	as_exp_trilean tv = as_exp_matches_metadata(*exp, &ctx);
 
-	if ((*predexp = as_exp_filter_build(f, false)) == NULL) {
-		return AS_ERR_PARAMETER;
-	}
-
-	// TODO - perhaps fields of as_predexp_context should be const?
-	as_exp_ctx predargs = { .ns = tr->rsv.ns, .r = (as_record*)r };
-	as_exp_trilean predrv = as_exp_matches_metadata(*predexp, &predargs);
-
-	if (predrv == AS_EXP_UNK) {
-		return AS_OK; // caller must later check bins using *predexp
+	if (tv == AS_EXP_UNK) {
+		return AS_OK; // caller must later check bins using *exp
 	}
 	// else - caller will not need to apply filter later.
 
-	as_exp_destroy(*predexp);
-	*predexp = NULL;
+	destroy_filter_exp(tr, *exp);
+	*exp = NULL;
 
-	return predrv == AS_EXP_TRUE ? AS_OK : AS_ERR_FILTERED_OUT;
+	return tv == AS_EXP_TRUE ? AS_OK : AS_ERR_FILTERED_OUT;
+}
+
+
+void
+destroy_filter_exp(const as_transaction* tr, as_exp* exp)
+{
+	if (SHARED_MSGP(tr)) {
+		return;
+	}
+
+	as_exp_destroy(exp);
 }
 
 
 int
-predexp_read_and_filter_bins(as_storage_rd* rd, as_exp* predexp)
+read_and_filter_bins(as_storage_rd* rd, as_exp* exp)
 {
 	as_namespace* ns = rd->ns;
 
@@ -197,9 +223,9 @@ predexp_read_and_filter_bins(as_storage_rd* rd, as_exp* predexp)
 		return -result;
 	}
 
-	as_exp_ctx predargs = { .ns = ns, .r = rd->r, .rd = rd };
+	as_exp_ctx ctx = { .ns = ns, .r = rd->r, .rd = rd };
 
-	if (! as_exp_matches_record(predexp, &predargs)) {
+	if (! as_exp_matches_record(exp, &ctx)) {
 		return AS_ERR_FILTERED_OUT;
 	}
 
@@ -345,79 +371,112 @@ pickle_all(as_storage_rd* rd, rw_request* rw)
 }
 
 
-bool
-write_sindex_update(as_namespace* ns, const char* set_name, cf_digest* keyd,
-		as_bin* old_bins, uint32_t n_old_bins, as_bin* new_bins,
-		uint32_t n_new_bins)
+void
+update_sindex(as_namespace* ns, as_index_ref* r_ref, as_bin* old_bins,
+		uint32_t n_old_bins, as_bin* new_bins, uint32_t n_new_bins)
 {
-	int n_populated = 0;
-	bool not_just_created[n_new_bins];
+	uint32_t n_populated = 0;
+	bool bin_name_in_both[n_new_bins];
 
-	memset(not_just_created, 0, sizeof(not_just_created));
-
-	// Maximum number of sindexes which can be changed in one transaction is
-	// 2 * ns->sindex_cnt.
+	// Initialize before the critical section to make it shorter.
+	memset(bin_name_in_both, 0, sizeof(bin_name_in_both));
 
 	SINDEX_GRLOCK();
+
+	// At max we will do both insert & delete for every sindex in the namespace.
 	SINDEX_BINS_SETUP(sbins, 2 * ns->sindex_cnt);
+
+	as_index* r = r_ref->r;
+	const char* set_name = as_index_get_set_name(r, ns);
 	as_sindex* si_arr[2 * ns->sindex_cnt];
-	int si_arr_index = 0;
+	uint32_t si_arr_index = 0;
 
 	// Reserve matching SIs.
 
-	for (int i = 0; i < n_old_bins; i++) {
+	for (uint32_t i = 0; i < n_old_bins; i++) {
 		si_arr_index += as_sindex_arr_lookup_by_set_binid_lockfree(ns, set_name,
 				old_bins[i].id, &si_arr[si_arr_index]);
 	}
 
-	for (int i = 0; i < n_new_bins; i++) {
+	for (uint32_t i = 0; i < n_new_bins; i++) {
 		si_arr_index += as_sindex_arr_lookup_by_set_binid_lockfree(ns, set_name,
 				new_bins[i].id, &si_arr[si_arr_index]);
 	}
+
+	if (si_arr_index == 0) {
+		SINDEX_GRUNLOCK();
+		as_index_clear_in_sindex(r); // no sindex corresponding to old/new bins
+		return;
+	}
+
+	bool record_in_sindex = false;
 
 	// For every old bin, find the corresponding new bin (if any) and adjust the
 	// secondary index if the bin was modified. If no corresponding new bin is
 	// found, it means the old bin was deleted - also adjust the secondary index
 	// accordingly.
-
-	for (int32_t i_old = 0; i_old < (int32_t)n_old_bins; i_old++) {
+	for (uint32_t i_old = 0; i_old < n_old_bins; i_old++) {
 		as_bin* b_old = &old_bins[i_old];
+		as_bin* b_new = NULL;
 		bool found = false;
 
-		// Loop over new bins. Start at old bin index (if possible) and go down,
-		// wrapping around to do the higher indexes last. This will find a match
-		// (if any) very quickly - instantly, unless there were bins deleted.
+		// Check same slot first. Optimize for bin list remaining same.
+		if (i_old < n_new_bins) {
+			uint32_t i_new = i_old;
 
-		bool any_new = n_new_bins != 0;
-		int32_t n_new_minus_1 = (int32_t)n_new_bins - 1;
-		int32_t i_new = n_new_minus_1 < i_old ? n_new_minus_1 : i_old;
-
-		while (any_new) {
-			as_bin* b_new = &new_bins[i_new];
+			b_new = &new_bins[i_new];
 
 			if (b_old->id == b_new->id) {
-				if (as_bin_get_particle_type(b_old) !=
-						as_bin_get_particle_type(b_new) ||
-								b_old->particle != b_new->particle) {
-					n_populated += as_sindex_sbins_populate(
-							&sbins[n_populated], ns, set_name, b_old, b_new);
-				}
-
 				found = true;
-				not_just_created[i_new] = true;
-				break;
-			}
-
-			if (--i_new < 0 && (i_new = n_new_minus_1) <= i_old) {
-				break;
-			}
-
-			if (i_new == i_old) {
-				break;
+				bin_name_in_both[i_new] = true;
 			}
 		}
 
 		if (! found) {
+			for (uint32_t i_new = 0; i_new < n_new_bins; i_new++) {
+				b_new = &new_bins[i_new];
+
+				if (b_old->id == b_new->id) {
+					found = true;
+					bin_name_in_both[i_new] = true;
+
+					break;
+				}
+			}
+		}
+
+		if (found) {
+			if (as_bin_get_particle_type(b_old) !=
+					as_bin_get_particle_type(b_new) ||
+					b_old->particle != b_new->particle) {
+				n_populated += as_sindex_sbins_from_bin(ns, set_name, b_old,
+						&sbins[n_populated], AS_SINDEX_OP_DELETE);
+
+				uint32_t n = as_sindex_sbins_from_bin(ns, set_name, b_new,
+						&sbins[n_populated], AS_SINDEX_OP_INSERT);
+
+				if (n != 0) {
+					record_in_sindex = true;
+				}
+
+				n_populated += n;
+			}
+			else if (r->in_sindex == 1 && ! record_in_sindex) {
+				// We only need to see whether this bin is in any sindex...
+
+				SINDEX_BINS_SETUP(dummy_sbins, ns->sindex_cnt);
+
+				uint32_t n = as_sindex_sbins_from_bin(ns, set_name, b_new,
+						dummy_sbins, AS_SINDEX_OP_INSERT);
+
+				if (n != 0) {
+					record_in_sindex = true;
+				}
+
+				as_sindex_sbin_freeall(dummy_sbins, n);
+			}
+		}
+		else {
 			n_populated += as_sindex_sbins_from_bin(ns, set_name, b_old,
 					&sbins[n_populated], AS_SINDEX_OP_DELETE);
 		}
@@ -427,33 +486,56 @@ write_sindex_update(as_namespace* ns, const char* set_name, cf_digest* keyd,
 	// in the loop above, so any left are just-created.
 
 	for (uint32_t i_new = 0; i_new < n_new_bins; i_new++) {
-		if (not_just_created[i_new]) {
+		if (bin_name_in_both[i_new]) {
 			continue;
 		}
 
-		n_populated += as_sindex_sbins_from_bin(ns, set_name, &new_bins[i_new],
+		uint32_t n = as_sindex_sbins_from_bin(ns, set_name, &new_bins[i_new],
 				&sbins[n_populated], AS_SINDEX_OP_INSERT);
+
+		if (n != 0) {
+			record_in_sindex = true;
+		}
+
+		n_populated += n;
 	}
 
 	SINDEX_GRUNLOCK();
 
+	if (record_in_sindex) {
+		// Mark record for sindex before insertion.
+		as_index_set_in_sindex(r);
+	}
+
 	if (n_populated != 0) {
-		as_sindex_update_by_sbin(ns, set_name, sbins, n_populated, keyd);
+		CF_ALLOC_SET_NS_ARENA(ns);
+
+		as_sindex_update_by_sbin(sbins, n_populated, r_ref->r_h);
 		as_sindex_sbin_freeall(sbins, n_populated);
 	}
 
-	as_sindex_release_arr(si_arr, si_arr_index);
+	if (! record_in_sindex) {
+		// Unmark record for sindex after deletion. in_sindex may not be set
+		// if the sindex building is in progress.
+		as_index_clear_in_sindex(r);
+	}
 
-	return n_populated != 0;
+	as_sindex_release_arr(si_arr, si_arr_index);
 }
 
 
-// If called for data-not-in-memory, this may read record from drive!
-// TODO - rename as as_record_... and move to record.c?
 void
-record_delete_adjust_sindex(as_record* r, as_namespace* ns)
+remove_from_sindex(as_namespace* ns, as_index_ref* r_ref)
 {
-	if (! record_has_sindex(r, ns)) {
+	as_record* r = r_ref->r;
+
+	if (r->in_sindex == 0) {
+		return;
+	}
+
+	if (! set_has_sindex(r, ns)) {
+		// Sindex drop will leave in_sindex bit. Good opportunity to clear.
+		as_index_clear_in_sindex(r);
 		return;
 	}
 
@@ -463,69 +545,49 @@ record_delete_adjust_sindex(as_record* r, as_namespace* ns)
 
 	as_bin stack_bins[RECORD_MAX_BINS];
 
-	// FIXME - should we handle failure?
 	as_storage_rd_load_bins(&rd, stack_bins);
-
-	remove_from_sindex(ns, as_index_get_set_name(r, ns), &r->keyd, rd.bins,
-			rd.n_bins);
+	remove_from_sindex_bins(ns, r_ref, rd.bins, rd.n_bins);
 
 	as_storage_record_close(&rd);
 }
 
 
-// Remove record from secondary index. Called only for data-in-memory. If
-// data-not-in-memory, existing record is not read, and secondary index entry is
-// cleaned up by background sindex defrag thread.
-// TODO - rename as as_record_... and move to record.c?
 void
-delete_adjust_sindex(as_storage_rd* rd)
-{
-	as_namespace* ns = rd->ns;
-
-	if (! record_has_sindex(rd->r, ns)) {
-		return;
-	}
-
-	as_bin stack_bins[RECORD_MAX_BINS];
-
-	as_storage_rd_load_bins(rd, stack_bins);
-
-	remove_from_sindex(ns, as_index_get_set_name(rd->r, ns), &rd->r->keyd,
-			rd->bins, rd->n_bins);
-}
-
-
-// TODO - rename as as_record_..., move to record.c, take r instead of set_name,
-// and lose keyd parameter?
-void
-remove_from_sindex(as_namespace* ns, const char* set_name, cf_digest* keyd,
-		as_bin* bins, uint32_t n_bins)
+remove_from_sindex_bins(as_namespace* ns, as_index_ref* r_ref, as_bin* bins,
+		uint32_t n_bins)
 {
 	SINDEX_GRLOCK();
 
 	SINDEX_BINS_SETUP(sbins, ns->sindex_cnt);
 
 	as_sindex* si_arr[ns->sindex_cnt];
-	int si_arr_index = 0;
-	int sbins_populated = 0;
+	uint32_t si_arr_index = 0;
+	uint32_t n_populated = 0;
+	as_index* r = r_ref->r;
+	const char* set_name = as_index_get_set_name(r, ns);
 
 	// Reserve matching sindexes.
-	for (int i = 0; i < (int)n_bins; i++) {
+	for (uint32_t i = 0; i < n_bins; i++) {
 		si_arr_index += as_sindex_arr_lookup_by_set_binid_lockfree(ns, set_name,
 				bins[i].id, &si_arr[si_arr_index]);
 	}
 
-	for (int i = 0; i < (int)n_bins; i++) {
-		sbins_populated += as_sindex_sbins_from_bin(ns, set_name, &bins[i],
-				&sbins[sbins_populated], AS_SINDEX_OP_DELETE);
+	for (uint32_t i = 0; i < n_bins; i++) {
+		n_populated += as_sindex_sbins_from_bin(ns, set_name, &bins[i],
+				&sbins[n_populated], AS_SINDEX_OP_DELETE);
 	}
 
 	SINDEX_GRUNLOCK();
 
-	if (sbins_populated) {
-		as_sindex_update_by_sbin(ns, set_name, sbins, sbins_populated, keyd);
-		as_sindex_sbin_freeall(sbins, sbins_populated);
+	if (n_populated != 0) {
+		CF_ALLOC_SET_NS_ARENA(ns);
+
+		as_sindex_update_by_sbin(sbins, n_populated, r_ref->r_h);
+		as_sindex_sbin_freeall(sbins, n_populated);
 	}
+
+	// Unmark record for sindex after deletion.
+	as_index_clear_in_sindex(r);
 
 	as_sindex_release_arr(si_arr, si_arr_index);
 }

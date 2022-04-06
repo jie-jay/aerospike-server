@@ -116,6 +116,9 @@ typedef struct ssprig_reduce_info_s {
 // Public API.
 //
 
+// Startup.
+void as_set_index_init(void);
+
 // Set-index tree lifecycle.
 void as_set_index_create_all(struct as_namespace_s* ns, struct as_index_tree_s* tree);
 void as_set_index_destroy_all(struct as_index_tree_s* tree);
@@ -149,7 +152,8 @@ ssprig_ele_cmp(const ssprig_info* ssi, const index_ele* e)
 	if (ssi->keyd_stub > e->keyd_stub) {
 		return 1;
 	}
-	else if (ssi->keyd_stub < e->keyd_stub) {
+
+	if (ssi->keyd_stub < e->keyd_stub) {
 		return -1;
 	}
 	// else - equal - need whole digests.

@@ -33,6 +33,7 @@
 #include "aerospike/as_atomic.h"
 #include "citrusleaf/alloc.h"
 #include "citrusleaf/cf_digest.h"
+#include "citrusleaf/cf_queue.h"
 
 #include "arenax.h"
 #include "cf_mutex.h"
@@ -43,6 +44,7 @@
 #include "base/datamodel.h"
 #include "base/index.h"
 #include "fabric/partition.h"
+#include "sindex/gc.h"
 
 //#include "warnings.h"
 
@@ -62,8 +64,6 @@ typedef struct populate_info_s {
 	as_set* p_set;
 	uint16_t set_id;
 	uint32_t pid;
-	uint32_t n_threads;
-	uint64_t start_ms;
 } populate_info;
 
 typedef struct populate_cb_info_s {
@@ -91,6 +91,8 @@ typedef struct populate_cb_info_s {
 
 cf_mutex g_balance_lock = CF_MUTEX_INIT;
 
+static cf_queue g_populate_q;
+
 
 //==========================================================
 // Forward declarations.
@@ -99,6 +101,8 @@ cf_mutex g_balance_lock = CF_MUTEX_INIT;
 static inline bool is_set_indexed(const as_namespace* ns, uint16_t set_id);
 static inline bool is_set_populated(const as_namespace* ns, uint16_t set_id);
 
+static int populate_q_reduce_cb(void* buf, void* udata);
+static void* run_populate_q(void* udata);
 static void* run_populate(void* udata);
 static bool populate_reduce_cb(as_index_ref* r_ref, void* udata);
 
@@ -146,6 +150,19 @@ static inline void
 uarena_set_handle(uarena_handle* h, uint32_t stage_id, uint32_t ele_id)
 {
 	*h = (stage_id << ELE_ID_N_BITS) | ele_id;
+}
+
+
+//==========================================================
+// Public API - startup.
+//
+
+void
+as_set_index_init(void)
+{
+	cf_queue_init(&g_populate_q, sizeof(populate_info), 4, true);
+
+	cf_thread_create_detached(run_populate_q, NULL);
 }
 
 
@@ -364,19 +381,13 @@ as_set_index_enable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 		return;
 	}
 
-	populate_info* popi = cf_malloc(sizeof(populate_info));
-
-	*popi = (populate_info){
+	populate_info popi = {
 			.ns = ns,
 			.p_set = p_set,
-			.set_id = set_id,
-			.n_threads = N_POPULATE_THREADS,
-			.start_ms = cf_getms()
+			.set_id = set_id
 	};
 
-	for (uint32_t n = 0; n < N_POPULATE_THREADS; n++) {
-		cf_thread_create_transient(run_populate, popi);
-	}
+	cf_queue_push(&g_populate_q, &popi);
 }
 
 void
@@ -396,6 +407,9 @@ as_set_index_disable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 	}
 
 	cf_mutex_unlock(&g_balance_lock);
+
+	// If it's still queued to be enabled, remove it from the queue.
+	cf_queue_reduce(&g_populate_q, populate_q_reduce_cb, p_set);
 
 	// If we cancelled, ensure cancellation is done (in case we repopulate).
 	while (p_set->index_populating) {
@@ -471,6 +485,51 @@ is_set_populated(const as_namespace* ns, uint16_t set_id)
 // Local helpers - population.
 //
 
+static int
+populate_q_reduce_cb(void* buf, void* udata)
+{
+	as_set* p_set = (as_set*)udata;
+
+	if (((populate_info*)buf)->p_set == p_set) {
+		p_set->index_populating = false;
+		return -2;
+	}
+
+	return 0;
+}
+
+static void*
+run_populate_q(void* udata)
+{
+	while (true) {
+		populate_info popi;
+
+		cf_queue_pop(&g_populate_q, &popi, CF_QUEUE_FOREVER);
+
+		cf_info(AS_INDEX, "{%s|%s} start populating set-index ...",
+				popi.ns->name, popi.p_set->name);
+
+		uint64_t start_ms = cf_getms();
+
+		cf_tid tids[N_POPULATE_THREADS];
+
+		for (uint32_t n = 0; n < N_POPULATE_THREADS; n++) {
+			tids[n] = cf_thread_create_joinable(run_populate, &popi);
+		}
+
+		for (uint32_t n = 0; n < N_POPULATE_THREADS; n++) {
+			cf_thread_join(tids[n]);
+		}
+
+		popi.p_set->index_populating = false;
+
+		cf_info(AS_INDEX, "{%s|%s} done populating set-index (%lu ms)",
+				popi.ns->name, popi.p_set->name, cf_getms() - start_ms);
+	}
+
+	return NULL;
+}
+
 static void*
 run_populate(void* udata)
 {
@@ -511,15 +570,6 @@ run_populate(void* udata)
 
 		stree_release(stree);
 		as_partition_release(&rsv);
-	}
-
-	if (as_aaf_uint32(&popi->n_threads, -1) == 0) {
-		popi->p_set->index_populating = false;
-
-		cf_info(AS_INDEX, "{%s|%s} done populating set-index (%lu ms)",
-				popi->ns->name, popi->p_set->name, cf_getms() - popi->start_ms);
-
-		cf_free(popi);
 	}
 
 	return NULL;
@@ -930,12 +980,17 @@ ssprig_reduce(ssprig_reduce_info* ssri, as_index_reduce_fn cb, void* udata)
 
 		// Ignore this record if it's been deleted.
 		if (! as_index_is_valid_record(r_ref.r)) {
+			as_namespace* ns = ssri->destructor_udata;
+
 			if (rc == 0) {
-				if (ssri->destructor) {
-					ssri->destructor(r_ref.r, ssri->destructor_udata);
+				if (ssri->destructor != NULL) {
+					ssri->destructor(r_ref.r, ns);
 				}
 
 				cf_arenax_free(ssi->arena, r_ref.r_h, NULL);
+			}
+			else if (r_ref.r->in_sindex == 1 && rc == 1) {
+				as_sindex_gc_record(ns, &r_ref);
 			}
 
 			cf_mutex_unlock(r_ref.olock);
@@ -971,31 +1026,17 @@ ssprig_traverse(ssprig_reduce_info* ssri, uarena_handle r_h,
 	index_ele* r = uarena_resolve(ssi->ua, r_h);
 	int cmp = 0; // initialized to satisfy compiler
 
-	if (ssi->keyd == NULL || (cmp = ssprig_ele_cmp(ssi, r)) < 0) {
+	if (ssi->keyd == NULL || (cmp = ssprig_ele_cmp(ssi, r)) > 0) {
 		ssprig_traverse(ssri, r->left_h, ph_a);
 	}
 
 	if (ph_a->n_used == ph_a->capacity) {
-		uint32_t new_capacity = ph_a->capacity * 2;
-		size_t new_sz = sizeof(as_index_ph) * new_capacity;
-
-		if (ph_a->is_stack) {
-			as_index_ph* phs = cf_malloc(new_sz);
-
-			memcpy(phs, ph_a->phs, sizeof(as_index_ph) * ph_a->capacity);
-			ph_a->phs = phs;
-			ph_a->is_stack = false;
-		}
-		else {
-			ph_a->phs = cf_realloc(ph_a->phs, new_sz);
-		}
-
-		ph_a->capacity = new_capacity;
+		as_index_grow_ph_array(ph_a);
 	}
 
 	// We do not collect the element with the boundary digest.
 
-	if (ssi->keyd == NULL || cmp < 0) {
+	if (ssi->keyd == NULL || cmp > 0) {
 		as_index* key_r = cf_arenax_resolve(ssi->arena, r->key_r_h);
 
 		as_index_reserve(key_r);

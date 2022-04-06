@@ -41,6 +41,7 @@
 #include "base/cfg.h"
 #include "fabric/fabric.h"
 #include "fabric/hlc.h"
+#include "fabric/partition_balance.h"
 
 /*
  * Overview
@@ -5584,7 +5585,7 @@ register_init()
  * Returns true if register sync is pending.
  */
 static bool
-register_is_sycn_pending()
+register_is_sync_pending()
 {
 	CLUSTERING_LOCK();
 	bool sync_pending = cf_vector_size(&g_register.sync_pending) > 0;
@@ -5602,7 +5603,7 @@ static void
 register_check_and_switch_synced()
 {
 	CLUSTERING_LOCK();
-	if (!register_is_sycn_pending()
+	if (!register_is_sync_pending()
 			&& g_register.state != AS_CLUSTERING_REGISTER_STATE_SYNCED) {
 		g_register.state = AS_CLUSTERING_REGISTER_STATE_SYNCED;
 		// Generate internal cluster changed synced.
@@ -5659,7 +5660,7 @@ register_syncing_timer_event_handle()
 		goto Exit;
 	}
 
-	if (register_is_sycn_pending()) {
+	if (register_is_sync_pending()) {
 		// Update pending nodes based on heartbeat status.
 		int num_pending = cf_vector_size(&g_register.sync_pending);
 		for (int i = 0; i < num_pending; i++) {
@@ -6476,7 +6477,10 @@ clustering_nodes_to_add_get(cf_vector* nodes_to_add)
 static void
 clustering_orphan_quantum_interval_start_handle()
 {
-	if (!as_hb_self_is_duplicate()) {
+	if (as_hb_self_is_duplicate()) {
+		WARNING("duplicate node-id - remain orphan");
+	}
+	else {
 		// Try to join a cluster or form a new one.
 		clustering_join_or_form_cluster();
 	}
@@ -6801,6 +6805,7 @@ clustering_principal_quantum_interval_start_handle(
 	DETAIL("principal node quantum wakeup");
 
 	if (as_hb_self_is_duplicate()) {
+		WARNING("duplicate node-id - changing state to orphan");
 		// Cluster is in a bad shape and self node has a duplicate node-id.
 		register_become_orphan (AS_CLUSTERING_MEMBERSHIP_LOST);
 		return;
@@ -7083,6 +7088,7 @@ clustering_non_principal_quantum_interval_start_handle()
 	clustering_join_requests_reject_all();
 
 	if (as_hb_self_is_duplicate()) {
+		WARNING("duplicate node-id - changing state to orphan");
 		// Cluster is in a bad shape and self node has a duplicate node-id.
 		register_become_orphan (AS_CLUSTERING_MEMBERSHIP_LOST);
 		return;
@@ -7682,13 +7688,17 @@ clustering_cluster_reform()
 	log_cf_node_vector("recluster: pending join requests - ", new_nodes,
 			cf_vector_size(new_nodes) > 0 ? CF_INFO : CF_DEBUG);
 
+	bool redundant = ! as_partition_balance_are_migrations_allowed();
+
 	if (!clustering_is_running() || !clustering_is_principal()
+			|| redundant
 			|| cf_vector_size(dead_nodes) > 0
 			|| cf_vector_size(faulty_nodes) > 0
 			|| cf_vector_size(new_nodes) > 0) {
 		INFO(
-				"recluster: skipped - principal %s dead_nodes %d faulty_nodes %d new_nodes %d",
+				"recluster: skipped - principal %s redundant %s dead_nodes %d faulty_nodes %d new_nodes %d",
 				clustering_is_principal() ? "true" : "false",
+				redundant ? "true" : "false",
 				cf_vector_size(dead_nodes), cf_vector_size(faulty_nodes),
 				cf_vector_size(new_nodes));
 

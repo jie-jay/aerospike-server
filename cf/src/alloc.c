@@ -43,6 +43,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 
+#include "bits.h"
 #include "cf_thread.h"
 #include "log.h"
 
@@ -72,6 +73,9 @@
 #define STR(x) STR_(x)
 
 #define MAX_INDENT (32 * 8)
+
+#define SALT_CHAR (0xAE)
+#define MAX_SALT_SZ (1024 * 1024 * 64ul)
 
 typedef struct site_info_s {
 	uint32_t site_id;
@@ -108,6 +112,7 @@ static int32_t g_startup_arena = -1;
 
 static cf_alloc_debug g_debug;
 static bool g_indent;
+static bool g_salt;
 
 static __thread as_random g_rand = { .initialized = false };
 
@@ -320,7 +325,8 @@ hook_handle_alloc_check(const void* ra, const void* p, size_t jem_sz)
 // site with the given address.
 
 static void
-hook_handle_free(const void *ra, void *p, size_t jem_sz)
+hook_handle_free(const void *ra, void *p, void *p_user, size_t jem_sz,
+		bool salt)
 {
 	hook_handle_alloc_check(ra, p, jem_sz);
 
@@ -360,6 +366,12 @@ hook_handle_free(const void *ra, void *p, size_t jem_sz)
 
 	for (uint32_t i = 0; i < 4 && i < delta; ++i) {
 		mark[i] = data[i];
+	}
+
+	if (salt) {
+		size_t sz = (size_t)(mark - (uint8_t *)p_user);
+
+		dead_memset(p_user, SALT_CHAR, sz > MAX_SALT_SZ ? MAX_SALT_SZ : sz);
 	}
 }
 
@@ -516,7 +528,7 @@ cf_alloc_init(void)
 	// Double-check that hook_get_arena() works, as it depends on JEMalloc's
 	// internal data structures.
 
-	int32_t err = jem_mallctl("thread.tcache.flush", NULL, NULL, NULL, 0);
+	int err = jem_mallctl("thread.tcache.flush", NULL, NULL, NULL, 0);
 
 	if (err != 0) {
 		cf_crash(CF_ALLOC, "error while flushing thread cache: %d (%s)", err, cf_strerror(err));
@@ -535,10 +547,12 @@ cf_alloc_init(void)
 }
 
 void
-cf_alloc_set_debug(cf_alloc_debug debug_allocations, bool indent_allocations)
+cf_alloc_set_debug(cf_alloc_debug debug_allocations, bool indent_allocations,
+		bool salt_allocations)
 {
 	g_debug = debug_allocations;
 	g_indent = indent_allocations;
+	g_salt = salt_allocations;
 
 	g_alloc_started = true;
 }
@@ -549,7 +563,7 @@ cf_alloc_create_arena(void)
 	int32_t arena;
 	size_t arena_len = sizeof(arena);
 
-	int32_t err = jem_mallctl("arenas.extend", &arena, &arena_len, NULL, 0);
+	int err = jem_mallctl("arenas.extend", &arena, &arena_len, NULL, 0);
 
 	if (err != 0) {
 		cf_crash(CF_ALLOC, "failed to create new arena: %d (%s)", err, cf_strerror(err));
@@ -566,7 +580,7 @@ cf_alloc_heap_stats(size_t *allocated_kbytes, size_t *active_kbytes, size_t *map
 	uint64_t epoch = 1;
 	size_t len = sizeof(epoch);
 
-	int32_t err = jem_mallctl("epoch", &epoch, &len, &epoch, len);
+	int err = jem_mallctl("epoch", &epoch, &len, &epoch, len);
 
 	if (err != 0) {
 		cf_crash(CF_ALLOC, "failed to retrieve epoch: %d (%s)", err, cf_strerror(err));
@@ -799,7 +813,7 @@ do_free(void *p_indent, const void *ra)
 	void *p = g_indent ? outdent(p_indent) : p_indent;
 	size_t jem_sz = jem_sallocx(p, 0);
 
-	hook_handle_free(ra, p, jem_sz);
+	hook_handle_free(ra, p, p_indent, jem_sz, g_salt);
 	jem_sdallocx(p, jem_sz, flags);
 }
 
@@ -808,6 +822,24 @@ __attribute__ ((noinline))
 free(void *p_indent)
 {
 	do_free(p_indent, __builtin_return_address(0));
+}
+
+static void
+tcache_destroy(void *udata)
+{
+	(void)udata;
+
+	if (g_ns_tcache >= 0) {
+		size_t len = sizeof(g_ns_tcache);
+
+		int err = jem_mallctl("tcache.destroy", NULL, 0, &g_ns_tcache, len);
+
+		if (err != 0) {
+			cf_crash(CF_ALLOC, "failed to destroy cache: %d (%s)", err, cf_strerror(err));
+		}
+
+		g_ns_tcache = -1;
+	}
 }
 
 static int32_t
@@ -823,7 +855,8 @@ calc_alloc_flags(int32_t flags, int32_t arena)
 		// Create startup arena, if necessary.
 		if (g_startup_arena < 0) {
 			size_t len = sizeof(g_startup_arena);
-			int32_t err = jem_mallctl("arenas.extend", &g_startup_arena, &len,
+
+			int err = jem_mallctl("arenas.extend", &g_startup_arena, &len,
 					NULL, 0);
 
 			if (err != 0) {
@@ -870,11 +903,14 @@ calc_alloc_flags(int32_t flags, int32_t arena)
 
 	if (g_ns_tcache < 0) {
 		size_t len = sizeof(g_ns_tcache);
-		int32_t err = jem_mallctl("tcache.create", &g_ns_tcache, &len, NULL, 0);
+
+		int err = jem_mallctl("tcache.create", &g_ns_tcache, &len, NULL, 0);
 
 		if (err != 0) {
 			cf_crash(CF_ALLOC, "failed to create new cache: %d (%s)", err, cf_strerror(err));
 		}
+
+		cf_thread_add_exit(tcache_destroy, NULL);
 	}
 
 	// Add the second (non-default) per-thread cache to the flags.
@@ -902,6 +938,10 @@ do_mallocx(size_t sz, int32_t arena, const void *ra)
 	void *p_indent = g_indent ? indent(p) : p;
 
 	hook_handle_alloc(ra, p, p_indent, sz);
+
+	if (g_salt) {
+		memset(p_indent, SALT_CHAR, sz > MAX_SALT_SZ ? MAX_SALT_SZ : sz);
+	}
 
 	return p_indent;
 }
@@ -1039,7 +1079,7 @@ do_rallocx(void *p_indent, size_t sz, int32_t arena, const void *ra)
 	void *p = g_indent ? outdent(p_indent) : p_indent;
 	size_t jem_sz = jem_sallocx(p, 0);
 
-	hook_handle_free(ra, p, jem_sz);
+	hook_handle_free(ra, p, p_indent, jem_sz, false);
 
 	size_t ext_sz = sz + sizeof(uint32_t);
 
@@ -1230,6 +1270,10 @@ do_valloc(size_t sz)
 	void *p = jem_aligned_alloc(PAGE_SZ, ext_sz);
 	hook_handle_alloc(__builtin_return_address(0), p, p, sz);
 
+	if (g_salt) {
+		memset(p, SALT_CHAR, sz > MAX_SALT_SZ ? MAX_SALT_SZ : sz);
+	}
+
 	return p;
 }
 
@@ -1324,6 +1368,10 @@ cf_rc_alloc(size_t sz)
 		}
 
 		hook_handle_alloc(__builtin_return_address(0), p, p_indent, tot_sz);
+
+		if (g_salt) {
+			memset(p_indent, SALT_CHAR, sz > MAX_SALT_SZ ? MAX_SALT_SZ : sz);
+		}
 	}
 
 	cf_rc_header *head = p_indent;
@@ -1354,7 +1402,7 @@ do_rc_free(void *body, void *ra)
 	void *p = g_indent ? outdent(head) : head;
 	size_t jem_sz = jem_sallocx(p, 0);
 
-	hook_handle_free(ra, p, jem_sz);
+	hook_handle_free(ra, p, body, jem_sz, g_salt);
 	jem_sdallocx(p, jem_sz, flags);
 }
 

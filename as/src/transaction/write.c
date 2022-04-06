@@ -1,7 +1,7 @@
 /*
  * write.c
  *
- * Copyright (C) 2016-2020 Aerospike, Inc.
+ * Copyright (C) 2016-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -35,6 +35,7 @@
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_clock.h"
 
+#include "arenax.h"
 #include "cf_mutex.h"
 #include "dynbuf.h"
 #include "log.h"
@@ -50,6 +51,7 @@
 #include "base/transaction_policy.h"
 #include "base/truncate.h"
 #include "base/xdr.h"
+#include "fabric/fabric.h"
 #include "fabric/partition.h"
 #include "sindex/secondary_index.h"
 #include "storage/storage.h"
@@ -95,8 +97,6 @@ int write_master_preprocessing(as_transaction* tr);
 int write_master_policies(as_transaction* tr, bool* p_must_not_create,
 		bool* p_record_level_replace, bool* p_must_fetch_data);
 bool check_msg_set_name(as_transaction* tr, const char* set_name);
-int iops_predexp_filter_meta(const as_transaction* tr, const as_record* r,
-		as_exp** predexp);
 
 int write_master_dim_single_bin(as_transaction* tr, as_index_ref* r_ref,
 		as_storage_rd* rd, rw_request* rw, bool* is_delete);
@@ -220,7 +220,7 @@ as_write_start(as_transaction* tr)
 	}
 
 	// Check that we aren't backed up.
-	if (as_storage_overloaded(tr->rsv.ns)) {
+	if (as_storage_overloaded(tr->rsv.ns, 0, "write")) {
 		tr->result_code = AS_ERR_DEVICE_OVERLOAD;
 		send_write_response(tr, NULL);
 		return TRANS_DONE_ERROR;
@@ -540,7 +540,7 @@ write_timeout_cb(rw_request* rw)
 transaction_status
 write_master(rw_request* rw, as_transaction* tr)
 {
-	CF_ALLOC_SET_NS_ARENA(tr->rsv.ns);
+	CF_ALLOC_SET_NS_ARENA_DIM(tr->rsv.ns);
 
 	//------------------------------------------------------
 	// Perform checks that don't need to loop over ops, or
@@ -629,12 +629,6 @@ write_master(rw_request* rw, as_transaction* tr)
 		// If it's an expired or truncated record, pretend it's a fresh create.
 		if (! record_created && is_doomed) {
 			as_set_index_delete_live(ns, tree, r, r_ref.r_h);
-
-			if (record_has_sindex(r, ns)) {
-				// Pessimistic, but not (yet) worth the full check.
-				tr->flags |= AS_TRANSACTION_FLAG_SINDEX_TOUCHED;
-			}
-
 			as_record_rescue(&r_ref, ns);
 			record_created = true;
 		}
@@ -685,15 +679,11 @@ write_master(rw_request* rw, as_transaction* tr)
 		return TRANS_DONE_ERROR;
 	}
 
-	// Apply predexp metadata filter if present.
+	as_exp* filter_exp = NULL;
 
-	as_exp* predexp = NULL;
-	as_exp* iops_predexp = NULL;
-
+	// Handle metadata filter if present.
 	if (! record_created && as_record_is_live(r) &&
-			(result = tr->origin == FROM_IOPS ?
-					iops_predexp_filter_meta(tr, r, &iops_predexp) :
-					build_predexp_and_filter_meta(tr, r, &predexp)) != 0) {
+			(result = handle_meta_filter(tr, r, &filter_exp)) != 0) {
 		write_master_failed(tr, &r_ref, false, tree, 0, result);
 		return TRANS_DONE_ERROR;
 	}
@@ -712,16 +702,15 @@ write_master(rw_request* rw, as_transaction* tr)
 		as_storage_record_open(ns, r, &rd);
 	}
 
-	// Apply predexp record bins filter if present.
-	if (predexp != NULL || iops_predexp != NULL) {
-		if ((result = predexp_read_and_filter_bins(&rd,
-				tr->origin == FROM_IOPS ? iops_predexp : predexp)) != 0) {
-			as_exp_destroy(predexp);
+	// Apply record bins filter if present.
+	if (filter_exp != NULL) {
+		if ((result = read_and_filter_bins(&rd, filter_exp)) != 0) {
+			destroy_filter_exp(tr, filter_exp);
 			write_master_failed(tr, &r_ref, false, tree, &rd, result);
 			return TRANS_DONE_ERROR;
 		}
 
-		as_exp_destroy(predexp);
+		destroy_filter_exp(tr, filter_exp);
 	}
 
 	// Shortcut for set name storage.
@@ -746,6 +735,13 @@ write_master(rw_request* rw, as_transaction* tr)
 	if (! set_replica_destinations(tr, rw)) {
 		write_master_failed(tr, &r_ref, record_created, tree, &rd, AS_ERR_UNAVAILABLE);
 		return TRANS_DONE_ERROR;
+	}
+
+	// Fire and forget can overload the fabric send queues - check.
+	if (respond_on_master_complete(tr) &&
+			as_fabric_is_overloaded(rw->dest_nodes, rw->n_dest_nodes,
+					AS_FABRIC_CHANNEL_RW, 0)) {
+		tr->flags |= AS_TRANSACTION_FLAG_SWITCH_TO_COMMIT_ALL;
 	}
 
 	// Will we need a pickle?
@@ -951,7 +947,7 @@ write_master_policies(as_transaction* tr, bool* p_must_not_create,
 
 	// Loop over ops to check and modify flags.
 	as_msg_op* op = NULL;
-	int i = 0;
+	uint16_t i = 0;
 
 	while ((op = as_msg_op_iterate(m, op, &i)) != NULL) {
 		if (op->op == AS_MSG_OP_TOUCH) {
@@ -1136,30 +1132,6 @@ check_msg_set_name(as_transaction* tr, const char* set_name)
 	}
 
 	return true;
-}
-
-
-int
-iops_predexp_filter_meta(const as_transaction* tr, const as_record* r,
-		as_exp** predexp)
-{
-	*predexp = tr->from.iops_orig->predexp;
-
-	if (*predexp == NULL) {
-		return AS_OK;
-	}
-
-	as_exp_ctx predargs = { .ns = tr->rsv.ns, .r = (as_record*)r };
-	as_exp_trilean predrv = as_exp_matches_metadata(*predexp, &predargs);
-
-	if (predrv == AS_EXP_UNK) {
-		return AS_OK; // caller must later check bins using *predexp
-	}
-	// else - caller will not need to apply filter later.
-
-	*predexp = NULL;
-
-	return predrv == AS_EXP_TRUE ? AS_OK : AS_ERR_FILTERED_OUT;
 }
 
 
@@ -1400,10 +1372,12 @@ write_master_dim(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 	// Success - adjust sindex, looking at old and new bins.
 	//
 
-	if (record_has_sindex(r, ns) &&
-			write_sindex_update(ns, rd->set_name, &tr->keyd, old_bins,
-					n_old_bins, rd->bins, rd->n_bins)) {
-		tr->flags |= AS_TRANSACTION_FLAG_SINDEX_TOUCHED;
+	if (set_has_sindex(r, ns)) {
+		update_sindex(ns, r_ref, old_bins, n_old_bins, rd->bins, rd->n_bins);
+	}
+	else {
+		// Sindex drop will leave in_sindex bit. Good opportunity to clear.
+		as_index_clear_in_sindex(r);
 	}
 
 	//------------------------------------------------------
@@ -1543,14 +1517,11 @@ write_master_ssd(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 	as_msg* m = &tr->msgp->msg;
 	as_namespace* ns = tr->rsv.ns;
 	as_record* r = rd->r;
-	bool has_sindex = record_has_sindex(r, ns);
+	bool set_has_si = set_has_sindex(r, ns);
+	bool si_needs_bins = set_has_si && r->in_sindex == 1;
 
 	// For sindex, we must read existing record even if replacing.
-	if (! must_fetch_data) {
-		must_fetch_data = has_sindex;
-	}
-
-	rd->ignore_record_on_device = ! must_fetch_data;
+	rd->ignore_record_on_device = ! must_fetch_data && ! si_needs_bins;
 
 	as_bin stack_bins[RECORD_MAX_BINS + m->n_ops];
 
@@ -1569,8 +1540,11 @@ write_master_ssd(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 	// bins array - to old bins array, for sindex purposes.
 	//
 
-	if (has_sindex && n_old_bins != 0) {
+	uint32_t n_old_bins_saved = 0;
+
+	if (si_needs_bins && n_old_bins != 0) {
 		memcpy(old_bins, rd->bins, n_old_bins * sizeof(as_bin));
+		n_old_bins_saved = n_old_bins;
 
 		// If it's a replace, clear the new bins array.
 		if (record_level_replace) {
@@ -1651,10 +1625,13 @@ write_master_ssd(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 	// Success - adjust sindex, looking at old and new bins.
 	//
 
-	if (has_sindex &&
-			write_sindex_update(ns, rd->set_name, &tr->keyd, old_bins,
-					n_old_bins, rd->bins, rd->n_bins)) {
-		tr->flags |= AS_TRANSACTION_FLAG_SINDEX_TOUCHED;
+	if (set_has_si) {
+		update_sindex(ns, r_ref, old_bins, n_old_bins_saved, rd->bins,
+				rd->n_bins);
+	}
+	else {
+		// Sindex drop will leave in_sindex bit. Good opportunity to clear.
+		as_index_clear_in_sindex(r);
 	}
 
 	//------------------------------------------------------
@@ -1772,7 +1749,7 @@ write_master_bin_ops_loop(as_transaction* tr, as_storage_rd* rd,
 	int result;
 
 	as_msg_op* op = NULL;
-	int i = 0;
+	uint16_t i = 0;
 
 	while ((op = as_msg_op_iterate(m, op, &i)) != NULL) {
 		if (! resolve_bin(rd, op, msg_lut, m->n_ops, &n_won, &result)) {

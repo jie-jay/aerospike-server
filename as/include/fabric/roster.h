@@ -37,7 +37,7 @@
 // Public API.
 //
 
-void as_roster_init_smd();
+void as_roster_init(void);
 bool as_roster_set_nodes_cmd(const char* ns_name, const char* nodes);
 
 

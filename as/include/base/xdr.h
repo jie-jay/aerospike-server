@@ -65,9 +65,11 @@ struct as_transaction_s;
 #define AS_XDR_MAX_TRANSACTION_QUEUE_LIMIT (1024 * 1024)
 
 typedef enum {
+	XDR_AUTH_NONE,
 	XDR_AUTH_INTERNAL,
 	XDR_AUTH_EXTERNAL,
 	XDR_AUTH_EXTERNAL_INSECURE,
+	XDR_AUTH_PKI,
 	XDR_AUTH_KERBEROS_LOCAL, // TODO - not yet implemented
 	XDR_AUTH_KERBEROS_LDAP // TODO - not yet implemented
 } as_xdr_auth_mode;
@@ -138,8 +140,6 @@ typedef struct as_xdr_dc_cfg_s {
 } as_xdr_dc_cfg;
 
 typedef struct as_xdr_config_s {
-	bool xdr_configured; // not actual config - indicates 'xdr' context present
-
 	uint8_t src_id;
 
 	// For debugging.

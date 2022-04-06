@@ -1,7 +1,7 @@
 /*
  * drv_ssd.c
  *
- * Copyright (C) 2009-2020 Aerospike, Inc.
+ * Copyright (C) 2009-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -53,6 +53,8 @@
 #include "cf_thread.h"
 #include "hist.h"
 #include "log.h"
+#include "os.h"
+#include "pool.h"
 #include "vmapx.h"
 
 #include "base/cfg.h"
@@ -75,6 +77,9 @@
 // Constants.
 //
 
+// TODO - could decrease this as number of drives increases?
+#define MAX_POOL_FDS 512 // power of 2 (rounds up anyway)
+
 #define WRITE_IN_PLACE 1
 
 
@@ -86,39 +91,69 @@
 int
 ssd_fd_get(drv_ssd *ssd)
 {
-	int fd = -1;
-	int rv = cf_queue_pop(ssd->fd_q, (void*)&fd, CF_QUEUE_NOWAIT);
+	while (true) {
+		int fd = cf_pool_int32_pop(&ssd->fd_pool);
 
-	if (rv != CF_QUEUE_OK) {
+		if (fd != -1) {
+			return fd;
+		}
+
+		uint32_t n_fds = as_load_uint32(&ssd->n_fds);
+
+		if (n_fds == MAX_POOL_FDS) {
+			cf_ticker_warning(AS_DRV_SSD, "%s: fd pool full", ssd->name);
+			sched_yield();
+			continue;
+		}
+
+		if (! as_cas_uint32(&ssd->n_fds, n_fds, n_fds + 1)) {
+			continue;
+		}
+
 		fd = open(ssd->name, ssd->open_flag, cf_os_base_perms());
 
-		if (-1 == fd) {
+		if (fd < 0) {
 			cf_crash(AS_DRV_SSD, "%s: DEVICE FAILED open: errno %d (%s)",
 					ssd->name, errno, cf_strerror(errno));
 		}
-	}
 
-	return fd;
+		return fd;
+	}
 }
 
 
 int
 ssd_fd_cache_get(drv_ssd *ssd)
 {
-	int fd = -1;
-	int rv = cf_queue_pop(ssd->fd_cache_q, (void*)&fd, CF_QUEUE_NOWAIT);
+	while (true) {
+		int fd = cf_pool_int32_pop(&ssd->fd_cache_pool);
 
-	if (rv != CF_QUEUE_OK) {
+		if (fd != -1) {
+			return fd;
+		}
+
+		uint32_t n_fds = as_load_uint32(&ssd->n_cache_fds);
+
+		if (n_fds == MAX_POOL_FDS) {
+			cf_ticker_warning(AS_DRV_SSD, "%s: cache fd pool full", ssd->name);
+			sched_yield();
+			continue;
+		}
+
+		if (! as_cas_uint32(&ssd->n_cache_fds, n_fds, n_fds + 1)) {
+			continue;
+		}
+
 		fd = open(ssd->name, ssd->open_flag & ~(O_DIRECT | O_DSYNC),
 				cf_os_base_perms());
 
-		if (-1 == fd) {
+		if (fd < 0) {
 			cf_crash(AS_DRV_SSD, "%s: DEVICE FAILED open: errno %d (%s)",
 					ssd->name, errno, cf_strerror(errno));
 		}
-	}
 
-	return fd;
+		return fd;
+	}
 }
 
 
@@ -131,7 +166,7 @@ ssd_shadow_fd_get(drv_ssd *ssd)
 	if (rv != CF_QUEUE_OK) {
 		fd = open(ssd->shadow_name, ssd->open_flag, cf_os_base_perms());
 
-		if (-1 == fd) {
+		if (fd < 0) {
 			cf_crash(AS_DRV_SSD, "%s: DEVICE FAILED open: errno %d (%s)",
 					ssd->shadow_name, errno, cf_strerror(errno));
 		}
@@ -145,14 +180,14 @@ ssd_shadow_fd_get(drv_ssd *ssd)
 void
 ssd_fd_put(drv_ssd *ssd, int fd)
 {
-	cf_queue_push(ssd->fd_q, (void*)&fd);
+	cf_pool_int32_push(&ssd->fd_pool, fd);
 }
 
 
 static inline void
 ssd_fd_cache_put(drv_ssd *ssd, int fd)
 {
-	cf_queue_push(ssd->fd_cache_q, (void*)&fd);
+	cf_pool_int32_push(&ssd->fd_cache_pool, fd);
 }
 
 
@@ -388,8 +423,12 @@ swb_dereference_and_release(drv_ssd *ssd, uint32_t wblock_id,
 }
 
 ssd_write_buf *
-swb_get(drv_ssd *ssd)
+swb_get(drv_ssd *ssd, bool use_reserve)
 {
+	if (! use_reserve && num_free_wblocks(ssd) <= DRV_DEFRAG_RESERVE) {
+		return NULL;
+	}
+
 	ssd_write_buf *swb;
 
 	if (CF_QUEUE_OK != cf_queue_pop(ssd->swb_free_q, &swb, CF_QUEUE_NOWAIT)) {
@@ -569,7 +608,7 @@ defrag_move_record(drv_ssd *src_ssd, uint32_t src_wblock_id,
 	ssd_write_buf *swb = ssd->defrag_swb;
 
 	if (! swb) {
-		swb = swb_get(ssd);
+		swb = swb_get(ssd, true);
 		ssd->defrag_swb = swb;
 
 		if (! swb) {
@@ -587,14 +626,17 @@ defrag_move_record(drv_ssd *src_ssd, uint32_t src_wblock_id,
 		cf_atomic64_incr(&ssd->n_defrag_wblock_writes);
 
 		// Get the new buffer.
-		swb = swb_get(ssd);
-		ssd->defrag_swb = swb;
+		while ((swb = swb_get(ssd, true)) == NULL) {
+			// If we got here, we used all our reserve wblocks, but the wblocks
+			// we defragged must still have non-zero inuse_sz. Must wait for
+			// those to become free.
+			cf_ticker_warning(AS_DRV_SSD, "{%s} defrag: drive %s totally full - waiting for vacated wblocks to be freed",
+					ssd->ns->name, ssd->name);
 
-		if (! swb) {
-			cf_warning(AS_DRV_SSD, "defrag_move_record: couldn't get swb");
-			cf_mutex_unlock(&ssd->defrag_lock);
-			return;
+			usleep(10 * 1000);
 		}
+
+		ssd->defrag_swb = swb;
 	}
 
 	memcpy(swb->buf + swb->pos, (const uint8_t*)flat, write_size);
@@ -677,49 +719,9 @@ ssd_record_defrag(drv_ssd *ssd, uint32_t wblock_id, as_flat_record *flat,
 }
 
 
-bool
-ssd_is_full(drv_ssd *ssd, uint32_t wblock_id)
-{
-	if (num_free_wblocks(ssd) > DRV_DEFRAG_STARTUP_RESERVE) {
-		return false;
-	}
-
-	ssd_wblock_state* p_wblock_state = &ssd->wblock_state[wblock_id];
-
-	cf_mutex_lock(&p_wblock_state->LOCK);
-
-	if (cf_atomic32_get(p_wblock_state->inuse_sz) == 0) {
-		// Lucky - wblock is empty, let ssd_defrag_wblock() free it.
-		cf_mutex_unlock(&p_wblock_state->LOCK);
-
-		return false;
-	}
-
-	cf_warning(AS_DRV_SSD, "{%s}: defrag: drive %s totally full, re-queuing wblock %u",
-			ssd->ns->name, ssd->name, wblock_id);
-
-	// Not using push_wblock_to_defrag_q() - state is already DEFRAG, we
-	// definitely have a queue, and it's better to push back to head.
-	cf_queue_push_head(ssd->defrag_wblock_q, &wblock_id);
-
-	cf_mutex_unlock(&p_wblock_state->LOCK);
-
-	// If we got here, we used all our runtime reserve wblocks, but the wblocks
-	// we defragged must still have non-zero inuse_sz. Must wait for those to
-	// become free. Sleep prevents retries from overwhelming the log.
-	sleep(1);
-
-	return true;
-}
-
-
 int
 ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 {
-	if (ssd_is_full(ssd, wblock_id)) {
-		return 0;
-	}
-
 	int record_count = 0;
 
 	ssd_wblock_state* p_wblock_state = &ssd->wblock_state[wblock_id];
@@ -744,7 +746,7 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 		cf_warning(AS_DRV_SSD, "%s: read failed: errno %d (%s)", ssd->name,
 				errno, cf_strerror(errno));
 		close(fd);
-		fd = -1;
+		as_decr_uint32(&ssd->n_fds);
 		goto Finished;
 	}
 
@@ -856,7 +858,7 @@ run_defrag(void *pv_data)
 			usleep(sleep_us);
 		}
 
-		while (ns->n_wblocks_to_flush > ns->storage_max_write_q + 100) {
+		while (ns->n_wblocks_to_flush > ns->storage_max_write_q + 128) {
 			usleep(1000);
 		}
 	}
@@ -1030,7 +1032,7 @@ ssd_load_wblock_queues(drv_ssds *ssds)
 	for (int i = 0; i < ssds->n_ssds; i++) {
 		drv_ssd *ssd = &ssds->ssds[i];
 
-		cf_info(AS_DRV_SSD, "%s init wblocks: pristine-id %u pristine %u free-q %d, defrag-q %d",
+		cf_info(AS_DRV_SSD, "%s init wblocks: pristine-id %u pristine %u free-q %u, defrag-q %u",
 				ssd->name, ssd->pristine_wblock_id, num_pristine_wblocks(ssd),
 				cf_queue_sz(ssd->free_wblock_q),
 				cf_queue_sz(ssd->defrag_wblock_q));
@@ -1144,6 +1146,8 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 					ssd->name, read_size, errno, cf_strerror(errno));
 			cf_free(read_buf);
 			close(fd);
+			as_decr_uint32(rd->read_page_cache ?
+					&ssd->n_cache_fds : &ssd->n_fds);
 			return -1;
 		}
 
@@ -1374,7 +1378,7 @@ ssd_post_write(drv_ssd *ssd, ssd_write_buf *swb)
 
 	if (ssd->post_write_q) {
 		// Release post-write queue swbs if we're over the limit.
-		while ((uint32_t)cf_queue_sz(ssd->post_write_q) >
+		while (cf_queue_sz(ssd->post_write_q) >
 				cf_atomic32_get(ssd->ns->storage_post_write_queue)) {
 			ssd_write_buf* cached_swb;
 
@@ -1487,10 +1491,20 @@ ssd_buffer_bins(as_storage_rd *rd)
 	as_record *r = rd->r;
 	drv_ssd *ssd = rd->ssd;
 
-	uint32_t flat_sz = rd->pickle == NULL ?
-			as_flat_record_size(rd) : rd->orig_pickle_sz;
+	uint32_t flat_sz;
+	uint32_t limit_sz;
 
-	if (flat_sz > ssd->write_block_size) {
+	if (rd->pickle == NULL) {
+		flat_sz = as_flat_record_size(rd);
+		limit_sz = ns->max_record_size == 0 ?
+				ssd->write_block_size : ns->max_record_size;
+	}
+	else {
+		flat_sz = rd->orig_pickle_sz;
+		limit_sz = ssd->write_block_size;
+	}
+
+	if (flat_sz > limit_sz) {
 		cf_detail(AS_DRV_SSD, "{%s} write: size %u - rejecting %pD", ns->name,
 				flat_sz, &r->keyd);
 		return -AS_ERR_RECORD_TOO_BIG;
@@ -1523,7 +1537,7 @@ ssd_buffer_bins(as_storage_rd *rd)
 	ssd_write_buf *swb = cur_swb->swb;
 
 	if (! swb) {
-		swb = swb_get(ssd);
+		swb = swb_get(ssd, false);
 		cur_swb->swb = swb;
 
 		if (! swb) {
@@ -1543,7 +1557,7 @@ ssd_buffer_bins(as_storage_rd *rd)
 		cur_swb->n_wblocks_written++;
 
 		// Get the new buffer.
-		swb = swb_get(ssd);
+		swb = swb_get(ssd, false);
 		cur_swb->swb = swb;
 
 		if (! swb) {
@@ -1812,15 +1826,15 @@ ssd_log_stats(drv_ssd *ssd, uint64_t *p_prev_n_total_writes,
 	*shadow_str = 0;
 
 	if (ssd->shadow_name) {
-		sprintf(shadow_str, " shadow-write-q %d",
+		sprintf(shadow_str, " shadow-write-q %u",
 				cf_queue_sz(ssd->swb_shadow_q));
 	}
 
-	uint32_t free_wblock_q_sz = (uint32_t)cf_queue_sz(ssd->free_wblock_q);
+	uint32_t free_wblock_q_sz = cf_queue_sz(ssd->free_wblock_q);
 	uint32_t n_pristine_wblocks = num_pristine_wblocks(ssd);
 	uint32_t n_free_wblocks = free_wblock_q_sz + n_pristine_wblocks;
 
-	cf_info(AS_DRV_SSD, "{%s} %s: used-bytes %lu free-wblocks %u write-q %d write (%lu,%.1f) defrag-q %d defrag-read (%lu,%.1f) defrag-write (%lu,%.1f)%s%s",
+	cf_info(AS_DRV_SSD, "{%s} %s: used-bytes %lu free-wblocks %u write-q %u write (%lu,%.1f) defrag-q %u defrag-read (%lu,%.1f) defrag-write (%lu,%.1f)%s%s",
 			ssd->ns->name, ssd->name,
 			ssd->inuse_size, n_free_wblocks,
 			cf_queue_sz(ssd->swb_write_q),
@@ -1852,7 +1866,7 @@ void
 ssd_free_swbs(drv_ssd *ssd)
 {
 	// Try to recover swbs, 16 at a time, down to 16.
-	for (int i = 0; i < 16 && cf_queue_sz(ssd->swb_free_q) > 16; i++) {
+	for (uint32_t i = 0; i < 16 && cf_queue_sz(ssd->swb_free_q) > 16; i++) {
 		ssd_write_buf* swb;
 
 		if (CF_QUEUE_OK !=
@@ -2471,9 +2485,9 @@ ssd_cold_start_add_record(drv_ssds* ssds, drv_ssd* ssd,
 		}
 		else {
 			// Success - adjust sindex, looking at old and new bins.
-			if (record_has_sindex(r, ns)) {
-				write_sindex_update(ns, as_index_get_set_name(r, ns), &r->keyd,
-						old_bins, n_old_bins, rd.bins, rd.n_bins);
+			if (set_has_sindex(r, ns)) {
+				update_sindex(ns, &r_ref, old_bins, n_old_bins, rd.bins,
+						rd.n_bins);
 			}
 
 			as_bin_destroy_all(old_bins, n_old_bins);
@@ -2652,7 +2666,7 @@ run_ssd_cold_start(void *udata)
 
 	cf_info(AS_DRV_SSD, "device %s: reading device to load index", ssd->name);
 
-	CF_ALLOC_SET_NS_ARENA(ns);
+	CF_ALLOC_SET_NS_ARENA_DIM(ns);
 
 	ssd_cold_start_sweep(ssds, ssd);
 
@@ -2671,6 +2685,8 @@ run_ssd_cold_start(void *udata)
 
 		as_truncate_list_cenotaphs(ns);
 		as_truncate_done_startup(ns); // set truncate last-update-times in sets' vmap
+
+		ssd_cold_start_set_unrepl_stat(ns);
 
 		void *_t = NULL;
 
@@ -2715,6 +2731,8 @@ start_loading_records(drv_ssds *ssds, cf_queue *complete_q)
 // Sindex startup utilities.
 //
 
+#define PROGRESS_RESOLUTION 1000
+
 static void* run_si_startup(void* udata);
 static void si_startup_sweep(drv_ssds* ssds, drv_ssd* ssd);
 static void si_startup_do_record(drv_ssds* ssds, drv_ssd* ssd,
@@ -2729,17 +2747,13 @@ run_si_startup(void* udata)
 	// Reuse counter - may expire more records while building sindex.
 	ssd->record_add_expired_counter = 0;
 
-	ssds->si_start_ms = cf_getms();
+	// Reuse counter - now for progress in sindex ticker.
+	ssd->record_add_unique_counter = 0;
 
 	si_startup_sweep(ssds, ssd);
 
 	cf_info(AS_DRV_SSD, "device %s: sindex sweep complete: expired %lu",
 			ssd->name, ssd->record_add_expired_counter);
-
-	if (as_aaf_uint32(&ssds->si_n_ssds_remaining, -1) == 0) {
-		as_sindex_ticker_done(ssd->ns, NULL, ssds->si_start_ms);
-		as_sindex_boot_populateall_done(ssd->ns);
-	}
 
 	return NULL;
 }
@@ -2895,9 +2909,10 @@ si_startup_do_record(drv_ssds* ssds, drv_ssd* ssd, as_flat_record* flat,
 		return;
 	}
 
-	// TODO - rethink - count things we don't look at bins for?
-	as_sindex_ticker(ns, NULL, as_aaf_uint64(&ssds->si_n_recs_read, 1),
-			ssds->si_start_ms);
+	if (++ssd->record_add_unique_counter == PROGRESS_RESOLUTION) {
+		as_add_uint64(&ns->si_n_recs_checked, PROGRESS_RESOLUTION);
+		ssd->record_add_unique_counter = 0;
+	}
 
 	// Skip records that have expired since resuming the index.
 	if (as_record_is_expired(r)) {
@@ -2909,7 +2924,7 @@ si_startup_do_record(drv_ssds* ssds, drv_ssd* ssd, as_flat_record* flat,
 		return;
 	}
 
-	if (! record_has_sindex(r, ns)) {
+	if (! set_has_sindex(r, ns)) {
 		as_record_done(&r_ref, ns);
 		return; // not in a sindex
 	}
@@ -2923,8 +2938,7 @@ si_startup_do_record(drv_ssds* ssds, drv_ssd* ssd, as_flat_record* flat,
 		cf_crash(AS_DRV_SSD, "unpack bins failed");
 	}
 
-	write_sindex_update(ns, as_index_get_set_name(r, ns), &r->keyd, NULL, 0,
-			bins, n_bins);
+	update_sindex(ns, &r_ref, NULL, 0, bins, n_bins);
 
 	as_record_done(&r_ref, ns);
 }
@@ -2997,6 +3011,8 @@ ssd_init_synchronous(drv_ssds *ssds)
 			first_used = i;
 		}
 	}
+
+	ssd_clear_encryption_keys(ns);
 
 	if (first_used < 0) {
 		// Shouldn't find all fresh headers here during warm or cool restart.
@@ -3531,11 +3547,6 @@ as_storage_init_ssd(as_namespace *ns)
 
 	cf_mutex_init(&ssds->flush_lock);
 
-	// Allow defrag to go full speed during startup - restore the configured
-	// settings when startup is done.
-	ns->saved_defrag_sleep = ns->storage_defrag_sleep;
-	ns->storage_defrag_sleep = 0;
-
 	// The queue limit is more efficient to work with.
 	ns->storage_max_write_q = (uint32_t)
 			(ssds->n_ssds * ns->storage_max_write_cache /
@@ -3583,8 +3594,8 @@ as_storage_init_ssd(as_namespace *ns)
 
 		// Note: free_wblock_q, defrag_wblock_q created after loading devices.
 
-		ssd->fd_q = cf_queue_create(sizeof(int), true);
-		ssd->fd_cache_q = cf_queue_create(sizeof(int), true);
+		cf_pool_int32_init(&ssd->fd_pool, MAX_POOL_FDS, -1);
+		cf_pool_int32_init(&ssd->fd_cache_pool, MAX_POOL_FDS, -1);
 
 		if (ssd->shadow_name) {
 			ssd->shadow_fd_q = cf_queue_create(sizeof(int), true);
@@ -3682,11 +3693,14 @@ as_storage_sindex_build_all_ssd(as_namespace* ns)
 {
 	drv_ssds* ssds = (drv_ssds*)ns->storage_private;
 
-	ssds->si_n_ssds_remaining = ssds->n_ssds;
-	ssds->si_n_recs_read = 0;
+	cf_tid tids[ssds->n_ssds];
 
 	for (int i = 0; i < ssds->n_ssds; i++) {
-		cf_thread_create_transient(run_si_startup, &ssds->ssds[i]);
+		tids[i] = cf_thread_create_joinable(run_si_startup, &ssds->ssds[i]);
+	}
+
+	for (int i = 0; i < ssds->n_ssds; i++) {
+		cf_thread_join(tids[i]);
 	}
 }
 
@@ -3700,7 +3714,40 @@ as_storage_activate_ssd(as_namespace *ns)
 
 	ssd_start_maintenance_threads(ssds);
 	ssd_start_write_threads(ssds);
+
+	if (ns->storage_defrag_startup_minimum != 0) {
+		// Allow defrag to go full speed during startup - restore configured
+		// setting when startup is done.
+		ns->saved_defrag_sleep = ns->storage_defrag_sleep;
+		ns->storage_defrag_sleep = 0;
+	}
+
 	ssd_start_defrag_threads(ssds);
+}
+
+
+bool
+as_storage_wait_for_defrag_ssd(as_namespace *ns)
+{
+	if (ns->storage_defrag_startup_minimum == 0) {
+		return false; // nothing to do - don't wait
+	}
+
+	int avail_pct;
+
+	as_storage_stats_ssd(ns, &avail_pct, NULL);
+
+	if (avail_pct >= (int)ns->storage_defrag_startup_minimum) {
+		// Restore configured defrag throttling values.
+		ns->storage_defrag_sleep = ns->saved_defrag_sleep;
+		return false; // done - don't wait
+	}
+	// else - not done - wait.
+
+	cf_info(AS_DRV_SSD, "{%s} wait-for-defrag: avail-pct %d wait-for %u ...",
+			ns->name, avail_pct, ns->storage_defrag_startup_minimum);
+
+	return true;
 }
 
 
@@ -3784,39 +3831,15 @@ as_storage_record_close_ssd(as_storage_rd *rd)
 // Storage API implementation: storage capacity monitoring.
 //
 
-void
-as_storage_wait_for_defrag_ssd(as_namespace *ns)
-{
-	if (ns->storage_defrag_startup_minimum > 0) {
-		while (true) {
-			int avail_pct;
-
-			as_storage_stats_ssd(ns, &avail_pct, NULL);
-
-			if (avail_pct >= ns->storage_defrag_startup_minimum) {
-				break;
-			}
-
-			cf_info(AS_DRV_SSD, "namespace %s waiting for defrag: %d pct available, waiting for %d ...",
-					ns->name, avail_pct, ns->storage_defrag_startup_minimum);
-
-			sleep(2);
-		}
-	}
-
-	// Restore configured defrag throttling values.
-	ns->storage_defrag_sleep = ns->saved_defrag_sleep;
-}
-
-
 bool
-as_storage_overloaded_ssd(const as_namespace *ns)
+as_storage_overloaded_ssd(const as_namespace *ns, uint32_t margin,
+		const char* tag)
 {
-	uint32_t max_write_q = as_load_uint32(&ns->storage_max_write_q);
+	uint32_t limit = ns->storage_max_write_q + margin;
 
-	if (ns->n_wblocks_to_flush > max_write_q) {
-		cf_ticker_warning(AS_DRV_SSD, "{%s} write fail: queue too deep: exceeds max %d",
-				ns->name, max_write_q);
+	if (ns->n_wblocks_to_flush > limit) {
+		cf_ticker_warning(AS_DRV_SSD, "{%s} %s fail: queue too deep: exceeds max %u",
+				ns->name, tag, limit);
 		return true;
 	}
 
@@ -4123,12 +4146,12 @@ as_storage_shutdown_ssd(as_namespace *ns)
 	for (int i = 0; i < ssds->n_ssds; i++) {
 		drv_ssd *ssd = &ssds->ssds[i];
 
-		while (cf_queue_sz(ssd->swb_write_q)) {
+		while (cf_queue_sz(ssd->swb_write_q) != 0) {
 			usleep(1000);
 		}
 
 		if (ssd->shadow_name) {
-			while (cf_queue_sz(ssd->swb_shadow_q)) {
+			while (cf_queue_sz(ssd->swb_shadow_q) != 0) {
 				usleep(1000);
 			}
 		}

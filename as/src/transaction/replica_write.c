@@ -1,7 +1,7 @@
 /*
  * replica_write.c
  *
- * Copyright (C) 2016-2020 Aerospike, Inc.
+ * Copyright (C) 2016-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -49,6 +49,7 @@
 #include "fabric/fabric.h"
 #include "fabric/partition.h"
 #include "sindex/secondary_index.h"
+#include "storage/storage.h"
 #include "transaction/delete.h"
 #include "transaction/rw_request.h"
 #include "transaction/rw_request_hash.h"
@@ -287,6 +288,12 @@ repl_write_handle_op(cf_node node, msg* m)
 		return;
 	}
 
+	// Replica writes are the last thing cut off when storage is backed up.
+	if (as_storage_overloaded(ns, 192, "replica write")) {
+		send_repl_write_ack_w_digest(node, m, AS_ERR_DEVICE_OVERLOAD, rr.keyd);
+		return;
+	}
+
 	as_partition_reservation rsv;
 	uint32_t result = as_partition_reserve_replica(ns,
 			as_partition_getid(rr.keyd), &rsv);
@@ -298,14 +305,7 @@ repl_write_handle_op(cf_node node, msg* m)
 
 	rr.rsv = &rsv;
 
-	uint32_t info = 0;
-
-	msg_get_uint32(m, RW_FIELD_INFO, &info);
-
-	// If source didn't touch sindex, may not need to touch it locally.
-	bool skip_sindex = (info & RW_INFO_SINDEX_TOUCHED) == 0;
-
-	result = (uint32_t)as_record_replace_if_better(&rr, skip_sindex);
+	result = (uint32_t)as_record_replace_if_better(&rr);
 
 	as_partition_release(&rsv);
 	send_repl_write_ack_w_digest(node, m, result, rr.keyd);
@@ -435,10 +435,6 @@ pack_info_bits(as_transaction* tr)
 {
 	uint32_t info = 0;
 
-	if ((tr->flags & AS_TRANSACTION_FLAG_SINDEX_TOUCHED) != 0) {
-		info |= RW_INFO_SINDEX_TOUCHED;
-	}
-
 	if (respond_on_master_complete(tr)) {
 		info |= RW_INFO_NO_REPL_ACK;
 	}
@@ -523,14 +519,12 @@ drop_replica(as_partition_reservation* rsv, cf_digest* keyd)
 		return; // not found is ok from master's perspective.
 	}
 
-	as_record* r = r_ref.r;
-
 	if (ns->storage_data_in_memory) {
-		record_delete_adjust_sindex(r, ns);
+		remove_from_sindex(ns, &r_ref);
 	}
 
 	// Note - may find a tombstone here if replica missed a generation.
-	as_set_index_delete_live(ns, tree, r, r_ref.r_h);
+	as_set_index_delete_live(ns, tree, r_ref.r, r_ref.r_h);
 	as_index_delete(tree, keyd);
 	as_record_done(&r_ref, ns);
 }

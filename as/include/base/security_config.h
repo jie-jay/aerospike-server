@@ -73,15 +73,16 @@ typedef enum {
 
 // Security configuration.
 typedef struct as_sec_config_s {
-	bool				ldap_enabled;
+	bool				security_configured;			// indirect config
 	bool				quotas_enabled;
-	bool				security_enabled;
-	uint32_t			n_ldap_login_threads;
 	uint32_t			privilege_refresh_period;	// (seconds)
+	uint32_t			session_ttl;				// (seconds)
 	uint32_t			tps_weight;
 
 	// LDAP scope configuration.
+	bool				ldap_configured;				// indirect config
 	bool 				ldap_tls_disabled;
+	uint32_t			n_ldap_login_threads;
 	uint32_t			ldap_polling_period;		// (seconds)
 	char*				ldap_query_base_dn;
 	char*				ldap_query_user_dn;
@@ -90,7 +91,6 @@ typedef struct as_sec_config_s {
 	char*				ldap_role_query_patterns[MAX_ROLE_QUERY_PATTERNS + 1];
 	bool				ldap_role_query_search_ou;
 	char*				ldap_server;
-	uint32_t			ldap_session_ttl;			// (seconds)
 	char*				ldap_tls_ca_file;			// set unless tls disabled
 	as_sec_ldap_evp_md	ldap_token_hash_method;
 	char*				ldap_user_dn_pattern;
@@ -106,10 +106,9 @@ typedef struct as_sec_config_s {
 #define TPS_WEIGHT_MIN					2
 #define TPS_WEIGHT_MAX					20
 
-#define LDAP_POLLING_PERIOD_MIN			0 // zero means don't poll
 #define LDAP_POLLING_PERIOD_MAX			(60 * 60 * 24)
-#define LDAP_SESSION_TTL_MIN			120
-#define LDAP_SESSION_TTL_MAX			(60 * 60 * 24 * 10)
+#define SECURITY_SESSION_TTL_MIN		120
+#define SECURITY_SESSION_TTL_MAX		(60 * 60 * 24 * 10)
 
 
 //==========================================================

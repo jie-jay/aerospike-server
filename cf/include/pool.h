@@ -1,7 +1,7 @@
 /*
- * write.h
+ * pool.h
  *
- * Copyright (C) 2016 Aerospike, Inc.
+ * Copyright (C) 2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -26,63 +26,60 @@
 // Includes.
 //
 
-#include "citrusleaf/alloc.h"
-
-#include "base/exp.h"
-#include "base/transaction.h"
-
-
-//==========================================================
-// Forward declarations.
-//
-
-struct as_exp_s;
-struct as_transaction_s;
-struct cl_msg_s;
+#include <stdbool.h>
+#include <stdint.h>
 
 
 //==========================================================
 // Typedefs & constants.
 //
 
-typedef struct iops_expop_s {
-	struct as_exp_s* exp;
-	uint64_t flags;
-} iops_expop;
+typedef struct cf_pool_int32_s {
+	uint32_t capacity;
+	uint32_t cap_minus_1;
 
-typedef void (*iops_cb)(void* udata, int result);
+	uint32_t read_ix;
+	uint32_t write_ix;
 
-typedef struct iops_origin_s {
-	struct cl_msg_s* msgp;
-	struct as_exp_s* filter_exp;
-	iops_expop* expops;
-	iops_cb cb;
-	void* udata;
-} iops_origin;
+	int32_t count;
+
+	int32_t empty_val;
+	int32_t* data;
+} cf_pool_int32;
+
+typedef struct cf_pool_ptr_s {
+	uint32_t capacity;
+	uint32_t cap_minus_1;
+
+	uint32_t read_ix;
+	uint32_t write_ix;
+
+	int32_t count;
+
+	void** data;
+} cf_pool_ptr;
 
 
 //==========================================================
-// Public API.
+// Public API - cf_pool_int32.
 //
 
-transaction_status as_write_start(struct as_transaction_s* tr);
+void cf_pool_int32_init(cf_pool_int32* pool, uint32_t capacity, int32_t empty_val);
+void cf_pool_int32_destroy(cf_pool_int32* pool);
 
-static inline void
-iops_expops_destroy(iops_expop* expops, uint16_t count)
-{
-	if (expops != NULL) {
-		for (uint16_t i = 0; i < count; i++) {
-			as_exp_destroy(expops[i].exp);
-		}
+int32_t cf_pool_int32_pop(cf_pool_int32* pool);
+void cf_pool_int32_push(cf_pool_int32* pool, int32_t val);
 
-		cf_free(expops);
-	}
-}
 
-static inline void
-iops_origin_destroy(iops_origin* origin)
-{
-	as_exp_destroy(origin->filter_exp);
-	iops_expops_destroy(origin->expops, origin->msgp->msg.n_ops);
-	cf_free(origin->msgp);
-}
+//==========================================================
+// Public API - cf_pool_ptr.
+//
+
+void cf_pool_ptr_init(cf_pool_ptr* pool, uint32_t capacity);
+void cf_pool_ptr_destroy(cf_pool_ptr* pool);
+
+void* cf_pool_ptr_pop(cf_pool_ptr* pool);
+void cf_pool_ptr_push(cf_pool_ptr* pool, void* val);
+
+bool cf_pool_ptr_remove(cf_pool_ptr* pool, void* val);
+uint32_t cf_pool_ptr_count(const cf_pool_ptr* pool);

@@ -95,7 +95,7 @@ struct as_storage_rd_s;
 #define AS_SEC_OK_LAST                  50 // the last message
 	// Security message errors.
 #define AS_SEC_ERR_NOT_SUPPORTED        51 // security features not supported
-#define AS_SEC_ERR_NOT_ENABLED          52 // security features not enabled
+#define AS_SEC_ERR_NOT_CONFIGURED       52 // security features not configured
 #define AS_SEC_ERR_SCHEME               53 // security scheme not supported
 #define AS_SEC_ERR_COMMAND              54 // unrecognized command
 #define AS_SEC_ERR_FIELD                55 // can't parse field
@@ -121,7 +121,7 @@ struct as_storage_rd_s;
 #define AS_SEC_ERR_NOT_WHITELISTED      82 // client IP-addr not on whitelist
 #define AS_SEC_ERR_QUOTA_EXCEEDED       83 // quota currently exceeded
 	// LDAP-related errors.
-#define AS_SEC_ERR_LDAP_NOT_ENABLED     90 // LDAP features not enabled
+#define AS_SEC_ERR_LDAP_NOT_CONFIGURED  90 // LDAP features not configured
 #define AS_SEC_ERR_LDAP_SETUP           91 // LDAP setup error
 #define AS_SEC_ERR_LDAP_TLS_SETUP       92 // LDAP TLS setup error
 #define AS_SEC_ERR_LDAP_AUTHENTICATION  93 // error authenticating LDAP user
@@ -144,7 +144,7 @@ struct as_storage_rd_s;
 #define AS_ERR_SINDEX_OOM               202
 #define AS_ERR_SINDEX_NOT_READABLE      203
 #define AS_ERR_SINDEX_GENERIC           204
-#define AS_ERR_SINDEX_NAME              205
+#define AS_ERR_SINDEX_NAME              205 // never used
 #define AS_ERR_SINDEX_MAX_COUNT         206
 
 // Query.
@@ -663,14 +663,14 @@ typedef enum {
 //
 
 typedef int (*as_netio_finish_cb) (void* udata, int retcode);
-typedef int (*as_netio_start_cb) (void* udata, int seq);
+typedef int (*as_netio_start_cb) (void* udata, uint32_t seq);
 
 typedef struct as_netio_s {
 	as_netio_finish_cb finish_cb;
 	as_netio_start_cb start_cb;
 	void* data;
 	struct as_file_handle_s* fd_h;
-	cf_buf_builder* bb_r;
+	cf_buf_builder* bb;
 	uint32_t offset;
 	uint32_t seq;
 	bool slow;
@@ -731,7 +731,7 @@ size_t as_msg_send_fin_timeout(cf_socket* sock, uint32_t result_code,
 		int32_t timeout);
 
 void as_netio_init();
-int as_netio_send(as_netio* io, bool slow, bool blocking);
+int as_netio_send(as_netio* io);
 
 static inline bool
 as_proto_is_valid_type(const as_proto* proto)
@@ -820,7 +820,7 @@ as_msg_op_skip(as_msg_op* op)
 }
 
 static inline as_msg_op*
-as_msg_op_iterate(const as_msg* msg, as_msg_op* current, int* n)
+as_msg_op_iterate(const as_msg* msg, as_msg_op* current, uint16_t* n)
 {
 	// Skip over the fields the first time.
 	if (! current) {

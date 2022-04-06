@@ -6504,7 +6504,7 @@ cdt_process_state_packed_map_modify_optype(cdt_process_state *state,
 	case AS_CDT_OP_MAP_INCREMENT:
 	case AS_CDT_OP_MAP_DECREMENT: {
 		cdt_payload key;
-		cdt_payload delta_value = { NULL };
+		cdt_payload delta_value = { 0 };
 		uint64_t flags = 0;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &key, &delta_value, &flags)) {
@@ -6643,7 +6643,7 @@ cdt_process_state_packed_map_modify_optype(cdt_process_state *state,
 
 		uint64_t result_type;
 		cdt_payload key_start;
-		cdt_payload key_end = { NULL };
+		cdt_payload key_end = { 0 };
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &key_start,
 				&key_end)) {
@@ -6680,7 +6680,7 @@ cdt_process_state_packed_map_modify_optype(cdt_process_state *state,
 
 		uint64_t result_type;
 		cdt_payload value_start;
-		cdt_payload value_end = { NULL };
+		cdt_payload value_end = { 0 };
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value_start,
 				&value_end)) {
@@ -6889,7 +6889,7 @@ cdt_process_state_packed_map_read_optype(cdt_process_state *state,
 	case AS_CDT_OP_MAP_GET_BY_KEY_INTERVAL: {
 		uint64_t result_type;
 		cdt_payload key_start;
-		cdt_payload key_end = { NULL };
+		cdt_payload key_end = { 0 };
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &key_start,
 				&key_end)) {
@@ -6905,7 +6905,7 @@ cdt_process_state_packed_map_read_optype(cdt_process_state *state,
 	case AS_CDT_OP_MAP_GET_BY_VALUE_INTERVAL: {
 		uint64_t result_type;
 		cdt_payload value_start;
-		cdt_payload value_end = { NULL };
+		cdt_payload value_end = { 0 };
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value_start,
 				&value_end)) {

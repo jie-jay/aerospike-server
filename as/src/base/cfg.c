@@ -55,6 +55,7 @@
 #include "log.h"
 #include "msg.h"
 #include "node.h"
+#include "os.h"
 #include "socket.h"
 #include "tls.h"
 #include "vault.h"
@@ -78,7 +79,6 @@
 #include "fabric/migrate.h"
 #include "fabric/partition_balance.h"
 #include "sindex/secondary_index.h"
-#include "sindex/thr_sindex.h"
 #include "storage/storage.h"
 
 
@@ -120,6 +120,20 @@ static void cfg_init_serv_spec(cf_serv_spec* spec_p);
 static cf_tls_spec* cfg_create_tls_spec(as_config* cfg, char* name);
 static char* cfg_resolve_tls_name(char* tls_name, const char* cluster_name, const char* which);
 static void cfg_keep_cap(bool keep, bool* what, int32_t cap);
+static void cfg_best_practices_check(void);
+
+
+//==========================================================
+// Inlines & macros.
+//
+
+#define check_failed(_db, _name, _msg, ...) \
+	do { \
+		cf_warning(AS_CFG, "failed " _name " check - " _msg, ##__VA_ARGS__); \
+		cf_dyn_buf_append_string(_db, _name); \
+		cf_dyn_buf_append_char(_db, ','); \
+	} \
+	while (false)
 
 
 //==========================================================
@@ -148,10 +162,12 @@ cfg_set_defaults()
 	c->batch_max_buffers_per_queue = 255; // maximum number of buffers allowed in a single queue
 	c->batch_max_requests = 5000; // maximum requests/digests in a single batch
 	c->batch_max_unused_buffers = 256; // maximum number of buffers allowed in batch buffer pool
+	c->batch_without_digests = true;
 	c->feature_key_files[0] = "/etc/aerospike/features.conf";
 	c->n_info_threads = 16;
 	c->migrate_max_num_incoming = AS_MIGRATE_DEFAULT_MAX_NUM_INCOMING; // for receiver-side migration flow-control
 	c->n_migrate_threads = 1;
+	cf_os_use_group_perms(false);
 	c->proto_slow_netio_sleep_ms = 1; // 1 ms sleep between retry for slow queries
 	c->run_as_daemon = true; // set false only to run in debugger & see console output
 	c->scan_max_done = 100;
@@ -204,12 +220,12 @@ cfg_set_defaults()
 
 	// TODO - security set default config API?
 	// Security defaults.
-	c->sec_cfg.n_ldap_login_threads = 8;
 	c->sec_cfg.privilege_refresh_period = 60 * 5; // refresh socket privileges every 5 minutes
+	c->sec_cfg.session_ttl = 60 * 60 * 24;
 	c->sec_cfg.tps_weight = TPS_WEIGHT_MIN;
 	// Security LDAP defaults.
+	c->sec_cfg.n_ldap_login_threads = 8;
 	c->sec_cfg.ldap_polling_period = 60 * 5;
-	c->sec_cfg.ldap_session_ttl = 60 * 60 * 24;
 	c->sec_cfg.ldap_token_hash_method = AS_LDAP_EVP_SHA_256;
 	// Security syslog defaults.
 	c->sec_cfg.syslog_local = AS_SYSLOG_NONE;
@@ -262,6 +278,7 @@ typedef enum {
 	CASE_SERVICE_ENABLE_BENCHMARKS_FABRIC,
 	CASE_SERVICE_ENABLE_HEALTH_CHECK,
 	CASE_SERVICE_ENABLE_HIST_INFO,
+	CASE_SERVICE_ENFORCE_BEST_PRACTICES,
 	CASE_SERVICE_FEATURE_KEY_FILE,
 	CASE_SERVICE_INFO_THREADS,
 	CASE_SERVICE_KEEP_CAPS_SSD_HEALTH,
@@ -277,10 +294,8 @@ typedef enum {
 	CASE_SERVICE_OS_GROUP_PERMS,
 	CASE_SERVICE_PROTO_FD_IDLE_MS,
 	CASE_SERVICE_QUERY_BATCH_SIZE,
-	CASE_SERVICE_QUERY_BUFPOOL_SIZE,
 	CASE_SERVICE_QUERY_IN_TRANSACTION_THREAD,
 	CASE_SERVICE_QUERY_LONG_Q_MAX_SIZE,
-	CASE_SERVICE_QUERY_PRE_RESERVE_PARTITIONS,
 	CASE_SERVICE_QUERY_PRIORITY,
 	CASE_SERVICE_QUERY_PRIORITY_SLEEP_US,
 	CASE_SERVICE_QUERY_REC_COUNT_BOUND,
@@ -296,7 +311,6 @@ typedef enum {
 	CASE_SERVICE_SCAN_THREADS_LIMIT,
 	CASE_SERVICE_SERVICE_THREADS,
 	CASE_SERVICE_SINDEX_BUILDER_THREADS,
-	CASE_SERVICE_SINDEX_GC_MAX_RATE,
 	CASE_SERVICE_SINDEX_GC_PERIOD,
 	CASE_SERVICE_STAY_QUIESCED,
 	CASE_SERVICE_TICKER_INTERVAL,
@@ -310,6 +324,7 @@ typedef enum {
 	// For special debugging or bug-related repair:
 	CASE_SERVICE_DEBUG_ALLOCATIONS,
 	CASE_SERVICE_INDENT_ALLOCATIONS,
+	CASE_SERVICE_SALT_ALLOCATIONS,
 	// Obsoleted:
 	CASE_SERVICE_ALLOW_INLINE_TRANSACTIONS,
 	CASE_SERVICE_NSUP_PERIOD,
@@ -475,6 +490,7 @@ typedef enum {
 	CASE_NAMESPACE_IGNORE_MIGRATE_FILL_DELAY,
 	CASE_NAMESPACE_INDEX_STAGE_SIZE,
 	CASE_NAMESPACE_INDEX_TYPE_BEGIN,
+	CASE_NAMESPACE_MAX_RECORD_SIZE,
 	CASE_NAMESPACE_MIGRATE_ORDER,
 	CASE_NAMESPACE_MIGRATE_RETRANSMIT_MS,
 	CASE_NAMESPACE_MIGRATE_SLEEP,
@@ -557,6 +573,7 @@ typedef enum {
 	CASE_NAMESPACE_STORAGE_PMEM_ENABLE_BENCHMARKS_STORAGE,
 	CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION,
 	CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION_KEY_FILE,
+	CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION_OLD_KEY_FILE,
 	CASE_NAMESPACE_STORAGE_PMEM_FLUSH_MAX_MS,
 	CASE_NAMESPACE_STORAGE_PMEM_MAX_WRITE_CACHE,
 	CASE_NAMESPACE_STORAGE_PMEM_MIN_AVAIL_PCT,
@@ -587,6 +604,7 @@ typedef enum {
 	CASE_NAMESPACE_STORAGE_DEVICE_ENABLE_BENCHMARKS_STORAGE,
 	CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION,
 	CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION_KEY_FILE,
+	CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION_OLD_KEY_FILE,
 	CASE_NAMESPACE_STORAGE_DEVICE_FLUSH_MAX_MS,
 	CASE_NAMESPACE_STORAGE_DEVICE_MAX_WRITE_CACHE,
 	CASE_NAMESPACE_STORAGE_DEVICE_MIN_AVAIL_PCT,
@@ -630,18 +648,20 @@ typedef enum {
 	CASE_MOD_LUA_USER_PATH,
 
 	// Security options:
-	CASE_SECURITY_ENABLE_LDAP,
 	CASE_SECURITY_ENABLE_QUOTAS,
-	CASE_SECURITY_ENABLE_SECURITY,
-	CASE_SECURITY_LDAP_LOGIN_THREADS,
 	CASE_SECURITY_PRIVILEGE_REFRESH_PERIOD,
+	CASE_SECURITY_SESSION_TTL,
 	CASE_SECURITY_TPS_WEIGHT,
 	CASE_SECURITY_LDAP_BEGIN,
 	CASE_SECURITY_LOG_BEGIN,
 	CASE_SECURITY_SYSLOG_BEGIN,
+	// Obsoleted:
+	CASE_SECURITY_ENABLE_LDAP,
+	CASE_SECURITY_ENABLE_SECURITY,
 
 	// Security LDAP options:
 	CASE_SECURITY_LDAP_DISABLE_TLS,
+	CASE_SECURITY_LDAP_LOGIN_THREADS,
 	CASE_SECURITY_LDAP_POLLING_PERIOD,
 	CASE_SECURITY_LDAP_QUERY_BASE_DN,
 	CASE_SECURITY_LDAP_QUERY_USER_DN,
@@ -650,7 +670,6 @@ typedef enum {
 	CASE_SECURITY_LDAP_ROLE_QUERY_PATTERN,
 	CASE_SECURITY_LDAP_ROLE_QUERY_SEARCH_OU,
 	CASE_SECURITY_LDAP_SERVER,
-	CASE_SECURITY_LDAP_SESSION_TTL,
 	CASE_SECURITY_LDAP_TLS_CA_FILE,
 	CASE_SECURITY_LDAP_TOKEN_HASH_METHOD,
 	CASE_SECURITY_LDAP_USER_DN_PATTERN,
@@ -700,9 +719,11 @@ typedef enum {
 	CASE_XDR_DC_USE_ALTERNATE_ACCESS_ADDRESS,
 
 	// XDR DC authentication mode (value tokens):
+	CASE_XDR_DC_AUTH_MODE_NONE,
 	CASE_XDR_DC_AUTH_MODE_INTERNAL,
 	CASE_XDR_DC_AUTH_MODE_EXTERNAL,
 	CASE_XDR_DC_AUTH_MODE_EXTERNAL_INSECURE,
+	CASE_XDR_DC_AUTH_MODE_PKI,
 
 	// XDR DC namespace options:
 	CASE_XDR_DC_NAMESPACE_BIN_POLICY,
@@ -779,6 +800,7 @@ const cfg_opt SERVICE_OPTS[] = {
 		{ "enable-benchmarks-fabric",		CASE_SERVICE_ENABLE_BENCHMARKS_FABRIC },
 		{ "enable-health-check",			CASE_SERVICE_ENABLE_HEALTH_CHECK },
 		{ "enable-hist-info",				CASE_SERVICE_ENABLE_HIST_INFO },
+		{ "enforce-best-practices",			CASE_SERVICE_ENFORCE_BEST_PRACTICES },
 		{ "feature-key-file",				CASE_SERVICE_FEATURE_KEY_FILE },
 		{ "info-threads",					CASE_SERVICE_INFO_THREADS },
 		{ "keep-caps-ssd-health",			CASE_SERVICE_KEEP_CAPS_SSD_HEALTH },
@@ -794,10 +816,8 @@ const cfg_opt SERVICE_OPTS[] = {
 		{ "os-group-perms",					CASE_SERVICE_OS_GROUP_PERMS },
 		{ "proto-fd-idle-ms",				CASE_SERVICE_PROTO_FD_IDLE_MS },
 		{ "query-batch-size",				CASE_SERVICE_QUERY_BATCH_SIZE },
-		{ "query-bufpool-size",				CASE_SERVICE_QUERY_BUFPOOL_SIZE },
 		{ "query-in-transaction-thread",	CASE_SERVICE_QUERY_IN_TRANSACTION_THREAD },
 		{ "query-long-q-max-size",			CASE_SERVICE_QUERY_LONG_Q_MAX_SIZE },
-		{ "query-pre-reserve-partitions",   CASE_SERVICE_QUERY_PRE_RESERVE_PARTITIONS },
 		{ "query-priority", 				CASE_SERVICE_QUERY_PRIORITY },
 		{ "query-priority-sleep-us", 		CASE_SERVICE_QUERY_PRIORITY_SLEEP_US },
 		{ "query-rec-count-bound",			CASE_SERVICE_QUERY_REC_COUNT_BOUND },
@@ -813,7 +833,6 @@ const cfg_opt SERVICE_OPTS[] = {
 		{ "scan-threads-limit",				CASE_SERVICE_SCAN_THREADS_LIMIT },
 		{ "service-threads",				CASE_SERVICE_SERVICE_THREADS },
 		{ "sindex-builder-threads",			CASE_SERVICE_SINDEX_BUILDER_THREADS },
-		{ "sindex-gc-max-rate",				CASE_SERVICE_SINDEX_GC_MAX_RATE },
 		{ "sindex-gc-period",				CASE_SERVICE_SINDEX_GC_PERIOD },
 		{ "stay-quiesced",					CASE_SERVICE_STAY_QUIESCED },
 		{ "ticker-interval",				CASE_SERVICE_TICKER_INTERVAL },
@@ -826,6 +845,7 @@ const cfg_opt SERVICE_OPTS[] = {
 		{ "work-directory",					CASE_SERVICE_WORK_DIRECTORY },
 		{ "debug-allocations",				CASE_SERVICE_DEBUG_ALLOCATIONS },
 		{ "indent-allocations",				CASE_SERVICE_INDENT_ALLOCATIONS },
+		{ "salt-allocations",				CASE_SERVICE_SALT_ALLOCATIONS },
 		{ "allow-inline-transactions",		CASE_SERVICE_ALLOW_INLINE_TRANSACTIONS },
 		{ "nsup-period",					CASE_SERVICE_NSUP_PERIOD },
 		{ "object-size-hist-period",		CASE_SERVICE_OBJECT_SIZE_HIST_PERIOD },
@@ -996,6 +1016,7 @@ const cfg_opt NAMESPACE_OPTS[] = {
 		{ "ignore-migrate-fill-delay",		CASE_NAMESPACE_IGNORE_MIGRATE_FILL_DELAY },
 		{ "index-stage-size",				CASE_NAMESPACE_INDEX_STAGE_SIZE },
 		{ "index-type",						CASE_NAMESPACE_INDEX_TYPE_BEGIN },
+		{ "max-record-size",				CASE_NAMESPACE_MAX_RECORD_SIZE },
 		{ "migrate-order",					CASE_NAMESPACE_MIGRATE_ORDER },
 		{ "migrate-retransmit-ms",			CASE_NAMESPACE_MIGRATE_RETRANSMIT_MS },
 		{ "migrate-sleep",					CASE_NAMESPACE_MIGRATE_SLEEP },
@@ -1086,6 +1107,7 @@ const cfg_opt NAMESPACE_STORAGE_PMEM_OPTS[] = {
 		{ "enable-benchmarks-storage",		CASE_NAMESPACE_STORAGE_PMEM_ENABLE_BENCHMARKS_STORAGE },
 		{ "encryption",						CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION },
 		{ "encryption-key-file",			CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION_KEY_FILE },
+		{ "encryption-old-key-file",		CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION_OLD_KEY_FILE },
 		{ "flush-max-ms",					CASE_NAMESPACE_STORAGE_PMEM_FLUSH_MAX_MS },
 		{ "max-write-cache",				CASE_NAMESPACE_STORAGE_PMEM_MAX_WRITE_CACHE },
 		{ "min-avail-pct",					CASE_NAMESPACE_STORAGE_PMEM_MIN_AVAIL_PCT },
@@ -1116,6 +1138,7 @@ const cfg_opt NAMESPACE_STORAGE_DEVICE_OPTS[] = {
 		{ "enable-benchmarks-storage",		CASE_NAMESPACE_STORAGE_DEVICE_ENABLE_BENCHMARKS_STORAGE },
 		{ "encryption",						CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION },
 		{ "encryption-key-file",			CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION_KEY_FILE },
+		{ "encryption-old-key-file",		CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION_OLD_KEY_FILE },
 		{ "flush-max-ms",					CASE_NAMESPACE_STORAGE_DEVICE_FLUSH_MAX_MS },
 		{ "max-write-cache",				CASE_NAMESPACE_STORAGE_DEVICE_MAX_WRITE_CACHE },
 		{ "min-avail-pct",					CASE_NAMESPACE_STORAGE_DEVICE_MIN_AVAIL_PCT },
@@ -1170,20 +1193,21 @@ const cfg_opt MOD_LUA_OPTS[] = {
 };
 
 const cfg_opt SECURITY_OPTS[] = {
-		{ "enable-ldap",					CASE_SECURITY_ENABLE_LDAP },
 		{ "enable-quotas",					CASE_SECURITY_ENABLE_QUOTAS },
-		{ "enable-security",				CASE_SECURITY_ENABLE_SECURITY },
-		{ "ldap-login-threads",				CASE_SECURITY_LDAP_LOGIN_THREADS },
 		{ "privilege-refresh-period",		CASE_SECURITY_PRIVILEGE_REFRESH_PERIOD },
+		{ "session-ttl",					CASE_SECURITY_SESSION_TTL },
 		{ "tps-weight",						CASE_SECURITY_TPS_WEIGHT },
 		{ "ldap",							CASE_SECURITY_LDAP_BEGIN },
 		{ "log",							CASE_SECURITY_LOG_BEGIN },
 		{ "syslog",							CASE_SECURITY_SYSLOG_BEGIN },
+		{ "enable-ldap",					CASE_SECURITY_ENABLE_LDAP },
+		{ "enable-security",				CASE_SECURITY_ENABLE_SECURITY },
 		{ "}",								CASE_CONTEXT_END }
 };
 
 const cfg_opt SECURITY_LDAP_OPTS[] = {
 		{ "disable-tls",					CASE_SECURITY_LDAP_DISABLE_TLS },
+		{ "login-threads",					CASE_SECURITY_LDAP_LOGIN_THREADS },
 		{ "polling-period",					CASE_SECURITY_LDAP_POLLING_PERIOD },
 		{ "query-base-dn",					CASE_SECURITY_LDAP_QUERY_BASE_DN },
 		{ "query-user-dn",					CASE_SECURITY_LDAP_QUERY_USER_DN },
@@ -1192,7 +1216,6 @@ const cfg_opt SECURITY_LDAP_OPTS[] = {
 		{ "role-query-pattern",				CASE_SECURITY_LDAP_ROLE_QUERY_PATTERN },
 		{ "role-query-search-ou",			CASE_SECURITY_LDAP_ROLE_QUERY_SEARCH_OU },
 		{ "server",							CASE_SECURITY_LDAP_SERVER },
-		{ "session-ttl",					CASE_SECURITY_LDAP_SESSION_TTL },
 		{ "tls-ca-file",					CASE_SECURITY_LDAP_TLS_CA_FILE },
 		{ "token-hash-method",				CASE_SECURITY_LDAP_TOKEN_HASH_METHOD },
 		{ "user-dn-pattern",				CASE_SECURITY_LDAP_USER_DN_PATTERN },
@@ -1250,9 +1273,11 @@ const cfg_opt XDR_DC_OPTS[] = {
 };
 
 const cfg_opt XDR_DC_AUTH_MODE_OPTS[] = {
+		{ "none",							CASE_XDR_DC_AUTH_MODE_NONE },
 		{ "internal",						CASE_XDR_DC_AUTH_MODE_INTERNAL },
 		{ "external",						CASE_XDR_DC_AUTH_MODE_EXTERNAL },
-		{ "external-insecure",				CASE_XDR_DC_AUTH_MODE_EXTERNAL_INSECURE }
+		{ "external-insecure",				CASE_XDR_DC_AUTH_MODE_EXTERNAL_INSECURE },
+		{ "pki",							CASE_XDR_DC_AUTH_MODE_PKI }
 };
 
 const cfg_opt XDR_DC_NAMESPACE_OPTS[] = {
@@ -2142,11 +2167,11 @@ as_config_init(const char* config_file)
 				break;
 			case CASE_SECURITY_BEGIN:
 				cfg_enterprise_only(&line);
+				c->sec_cfg.security_configured = true;
 				cfg_begin_context(&state, SECURITY);
 				break;
 			case CASE_XDR_BEGIN:
 				cfg_enterprise_only(&line);
-				c->xdr_cfg.xdr_configured = true;
 				cfg_begin_context(&state, XDR);
 				break;
 			case CASE_NOT_FOUND:
@@ -2226,6 +2251,7 @@ as_config_init(const char* config_file)
 				c->batch_max_unused_buffers = cfg_u32_no_checks(&line);
 				break;
 			case CASE_SERVICE_BATCH_WITHOUT_DIGESTS:
+				// TODO - remove in "six months".
 				c->batch_without_digests = cfg_bool(&line);
 				break;
 			case CASE_SERVICE_CLUSTER_NAME:
@@ -2242,6 +2268,9 @@ as_config_init(const char* config_file)
 				break;
 			case CASE_SERVICE_ENABLE_HIST_INFO:
 				c->info_hist_enabled = cfg_bool(&line);
+				break;
+			case CASE_SERVICE_ENFORCE_BEST_PRACTICES:
+				c->enforce_best_practices = cfg_bool(&line);
 				break;
 			case CASE_SERVICE_FEATURE_KEY_FILE:
 				cfg_enterprise_only(&line);
@@ -2290,23 +2319,17 @@ as_config_init(const char* config_file)
 			case CASE_SERVICE_QUERY_BATCH_SIZE:
 				c->query_bsize = cfg_int_no_checks(&line);
 				break;
-			case CASE_SERVICE_QUERY_BUFPOOL_SIZE:
-				c->query_bufpool_size = cfg_u32(&line, 1, UINT32_MAX);
-				break;
 			case CASE_SERVICE_QUERY_IN_TRANSACTION_THREAD:
 				c->query_in_transaction_thr = cfg_bool(&line);
 				break;
 			case CASE_SERVICE_QUERY_LONG_Q_MAX_SIZE:
 				c->query_long_q_max_size = cfg_u32(&line, 1, UINT32_MAX);
 				break;
-			case CASE_SERVICE_QUERY_PRE_RESERVE_PARTITIONS:
-				c->partitions_pre_reserved = cfg_bool(&line);
-				break;
 			case CASE_SERVICE_QUERY_PRIORITY:
 				c->query_priority = cfg_int_no_checks(&line);
 				break;
 			case CASE_SERVICE_QUERY_PRIORITY_SLEEP_US:
-				c->query_sleep_us = cfg_u64_no_checks(&line);
+				c->query_sleep_us = cfg_u32_no_checks(&line);
 				break;
 			case CASE_SERVICE_QUERY_REC_COUNT_BOUND:
 				c->query_rec_count_bound = cfg_u64(&line, 1, UINT64_MAX);
@@ -2336,7 +2359,7 @@ as_config_init(const char* config_file)
 				c->run_as_daemon = cfg_bool_no_value_is_true(&line);
 				break;
 			case CASE_SERVICE_SCAN_MAX_DONE:
-				c->scan_max_done = cfg_u32(&line, 0, 1000);
+				c->scan_max_done = cfg_u32(&line, 0, 10000);
 				break;
 			case CASE_SERVICE_SCAN_THREADS_LIMIT:
 				c->n_scan_threads_limit = cfg_u32(&line, 1, 1024);
@@ -2345,10 +2368,7 @@ as_config_init(const char* config_file)
 				c->n_service_threads = cfg_u32(&line, 1, MAX_SERVICE_THREADS);
 				break;
 			case CASE_SERVICE_SINDEX_BUILDER_THREADS:
-				c->sindex_builder_threads = cfg_u32(&line, 1, MAX_SINDEX_BUILDER_THREADS);
-				break;
-			case CASE_SERVICE_SINDEX_GC_MAX_RATE:
-				c->sindex_gc_max_rate = cfg_u32_no_checks(&line);
+				c->sindex_builder_threads = cfg_u32(&line, 1, 32);
 				break;
 			case CASE_SERVICE_SINDEX_GC_PERIOD:
 				c->sindex_gc_period = cfg_u32_no_checks(&line);
@@ -2405,9 +2425,12 @@ as_config_init(const char* config_file)
 					break;
 				}
 				break;
-			case CASE_SERVICE_INDENT_ALLOCATIONS:
-				c->indent_allocations = cfg_bool(&line);
-				break;
+				case CASE_SERVICE_INDENT_ALLOCATIONS:
+					c->indent_allocations = cfg_bool(&line);
+					break;
+				case CASE_SERVICE_SALT_ALLOCATIONS:
+					c->salt_allocations = cfg_bool(&line);
+					break;
 			case CASE_SERVICE_ALLOW_INLINE_TRANSACTIONS:
 				cfg_obsolete(&line, "please configure 'service-threads' carefully");
 				break;
@@ -2864,6 +2887,7 @@ as_config_init(const char* config_file)
 					cfg_enterprise_only(&line);
 					ns->storage_type = AS_STORAGE_ENGINE_PMEM;
 					ns->storage_data_in_memory = false;
+					ns->storage_write_block_size = 8 * 1024 * 1024;
 					cfg_begin_context(&state, NAMESPACE_STORAGE_PMEM);
 					break;
 				case CASE_NAMESPACE_STORAGE_DEVICE:
@@ -2972,6 +2996,9 @@ as_config_init(const char* config_file)
 					cfg_unknown_val_tok_1(&line);
 					break;
 				}
+				break;
+			case CASE_NAMESPACE_MAX_RECORD_SIZE:
+				ns->max_record_size = cfg_u32_no_checks(&line);
 				break;
 			case CASE_NAMESPACE_MIGRATE_ORDER:
 				ns->migrate_order = cfg_u32(&line, 1, 10);
@@ -3115,6 +3142,17 @@ as_config_init(const char* config_file)
 				if (ns->conflict_resolve_writes && ns->single_bin) {
 					cf_crash_nostack(AS_CFG, "{%s} 'conflict-resolve-writes' can't be true if 'single-bin' is true", ns->name);
 				}
+				if (ns->max_record_size != 0) {
+					if (ns->storage_type == AS_STORAGE_ENGINE_MEMORY && ns->max_record_size > 128 * 1024 * 1024) { // PROTO_SIZE_MAX
+						cf_crash_nostack(AS_CFG, "{%s} 'max-record-size' can't be bigger than 128M", ns->name);
+					}
+					if (ns->storage_type == AS_STORAGE_ENGINE_PMEM && ns->max_record_size > 8 * 1024 * 1024) { // PMEM_WRITE_BLOCK_SIZE
+						cf_crash_nostack(AS_CFG, "{%s} 'max-record-size' can't be bigger than 8M", ns->name);
+					}
+					if (ns->storage_type == AS_STORAGE_ENGINE_SSD && ns->max_record_size > ns->storage_write_block_size) {
+						cf_crash_nostack(AS_CFG, "{%s} 'max-record-size' can't be bigger than 'write-block-size'", ns->name);
+					}
+				}
 				if (ns->storage_data_in_memory) {
 					ns->storage_post_write_queue = 0; // override default (or configuration mistake)
 				}
@@ -3237,7 +3275,7 @@ as_config_init(const char* config_file)
 				ns->storage_defrag_sleep = cfg_u32_no_checks(&line);
 				break;
 			case CASE_NAMESPACE_STORAGE_PMEM_DEFRAG_STARTUP_MINIMUM:
-				ns->storage_defrag_startup_minimum = cfg_int(&line, 1, 99);
+				ns->storage_defrag_startup_minimum = cfg_u32(&line, 0, 99);
 				break;
 			case CASE_NAMESPACE_STORAGE_PMEM_DIRECT_FILES:
 				ns->storage_direct_files = cfg_bool(&line);
@@ -3265,6 +3303,9 @@ as_config_init(const char* config_file)
 				break;
 			case CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION_KEY_FILE:
 				ns->storage_encryption_key_file = cfg_strdup_no_checks(&line);
+				break;
+			case CASE_NAMESPACE_STORAGE_PMEM_ENCRYPTION_OLD_KEY_FILE:
+				ns->storage_encryption_old_key_file = cfg_strdup_no_checks(&line);
 				break;
 			case CASE_NAMESPACE_STORAGE_PMEM_FLUSH_MAX_MS:
 				ns->storage_flush_max_us = cfg_u64_no_checks(&line) * 1000;
@@ -3375,7 +3416,7 @@ as_config_init(const char* config_file)
 				ns->storage_defrag_sleep = cfg_u32_no_checks(&line);
 				break;
 			case CASE_NAMESPACE_STORAGE_DEVICE_DEFRAG_STARTUP_MINIMUM:
-				ns->storage_defrag_startup_minimum = cfg_int(&line, 1, 99);
+				ns->storage_defrag_startup_minimum = cfg_u32(&line, 0, 99);
 				break;
 			case CASE_NAMESPACE_STORAGE_DEVICE_DIRECT_FILES:
 				ns->storage_direct_files = cfg_bool(&line);
@@ -3404,6 +3445,10 @@ as_config_init(const char* config_file)
 			case CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION_KEY_FILE:
 				cfg_enterprise_only(&line);
 				ns->storage_encryption_key_file = cfg_strdup_no_checks(&line);
+				break;
+			case CASE_NAMESPACE_STORAGE_DEVICE_ENCRYPTION_OLD_KEY_FILE:
+				cfg_enterprise_only(&line);
+				ns->storage_encryption_old_key_file = cfg_strdup_no_checks(&line);
 				break;
 			case CASE_NAMESPACE_STORAGE_DEVICE_FLUSH_MAX_MS:
 				ns->storage_flush_max_us = cfg_u64_no_checks(&line) * 1000;
@@ -3498,7 +3543,7 @@ as_config_init(const char* config_file)
 		case NAMESPACE_SINDEX:
 			switch (cfg_find_tok(line.name_tok, NAMESPACE_SINDEX_OPTS, NUM_NAMESPACE_SINDEX_OPTS)) {
 			case CASE_NAMESPACE_SINDEX_NUM_PARTITIONS:
-				ns->sindex_num_partitions = cfg_u32(&line, MIN_PARTITIONS_PER_INDEX, MAX_PARTITIONS_PER_INDEX);
+				ns->sindex_num_partitions = cfg_u32(&line, MIN_PARTITIONS_PER_SINDEX, MAX_PARTITIONS_PER_SINDEX);
 				break;
 			case CASE_CONTEXT_END:
 				cfg_end_context(&state);
@@ -3511,7 +3556,7 @@ as_config_init(const char* config_file)
 			break;
 
 		//----------------------------------------
-		// Parse namespace::2dsphere-within context items.
+		// Parse namespace::geo2dsphere-within context items.
 		//
 		case NAMESPACE_GEO2DSPHERE_WITHIN:
 			switch (cfg_find_tok(line.name_tok, NAMESPACE_GEO2DSPHERE_WITHIN_OPTS, NUM_NAMESPACE_GEO2DSPHERE_WITHIN_OPTS)) {
@@ -3569,25 +3614,20 @@ as_config_init(const char* config_file)
 		//
 		case SECURITY:
 			switch (cfg_find_tok(line.name_tok, SECURITY_OPTS, NUM_SECURITY_OPTS)) {
-			case CASE_SECURITY_ENABLE_LDAP:
-				c->sec_cfg.ldap_enabled = cfg_bool(&line);
-				break;
 			case CASE_SECURITY_ENABLE_QUOTAS:
 				c->sec_cfg.quotas_enabled = cfg_bool(&line);
 				break;
-			case CASE_SECURITY_ENABLE_SECURITY:
-				c->sec_cfg.security_enabled = cfg_bool(&line);
-				break;
-			case CASE_SECURITY_LDAP_LOGIN_THREADS:
-				c->sec_cfg.n_ldap_login_threads = cfg_u32(&line, 1, 64);
-				break;
 			case CASE_SECURITY_PRIVILEGE_REFRESH_PERIOD:
 				c->sec_cfg.privilege_refresh_period = cfg_seconds(&line, PRIVILEGE_REFRESH_PERIOD_MIN, PRIVILEGE_REFRESH_PERIOD_MAX);
+				break;
+			case CASE_SECURITY_SESSION_TTL:
+				c->sec_cfg.session_ttl = cfg_seconds(&line, SECURITY_SESSION_TTL_MIN, SECURITY_SESSION_TTL_MAX);
 				break;
 			case CASE_SECURITY_TPS_WEIGHT:
 				c->sec_cfg.tps_weight = cfg_u32(&line, TPS_WEIGHT_MIN, TPS_WEIGHT_MAX);
 				break;
 			case CASE_SECURITY_LDAP_BEGIN:
+				c->sec_cfg.ldap_configured = true;
 				cfg_begin_context(&state, SECURITY_LDAP);
 				break;
 			case CASE_SECURITY_LOG_BEGIN:
@@ -3595,6 +3635,12 @@ as_config_init(const char* config_file)
 				break;
 			case CASE_SECURITY_SYSLOG_BEGIN:
 				cfg_begin_context(&state, SECURITY_SYSLOG);
+				break;
+			case CASE_SECURITY_ENABLE_LDAP:
+				cfg_obsolete(&line, "the 'ldap' context automatically enables LDAP");
+				break;
+			case CASE_SECURITY_ENABLE_SECURITY:
+				cfg_obsolete(&line, "the 'security' context automatically enables security");
 				break;
 			case CASE_CONTEXT_END:
 				cfg_end_context(&state);
@@ -3614,8 +3660,11 @@ as_config_init(const char* config_file)
 			case CASE_SECURITY_LDAP_DISABLE_TLS:
 				c->sec_cfg.ldap_tls_disabled = cfg_bool(&line);
 				break;
+			case CASE_SECURITY_LDAP_LOGIN_THREADS:
+				c->sec_cfg.n_ldap_login_threads = cfg_u32(&line, 1, 64);
+				break;
 			case CASE_SECURITY_LDAP_POLLING_PERIOD:
-				c->sec_cfg.ldap_polling_period = cfg_seconds(&line, LDAP_POLLING_PERIOD_MIN, LDAP_POLLING_PERIOD_MAX);
+				c->sec_cfg.ldap_polling_period = cfg_seconds(&line, 0, LDAP_POLLING_PERIOD_MAX);
 				break;
 			case CASE_SECURITY_LDAP_QUERY_BASE_DN:
 				c->sec_cfg.ldap_query_base_dn = cfg_strdup_no_checks(&line);
@@ -3637,9 +3686,6 @@ as_config_init(const char* config_file)
 				break;
 			case CASE_SECURITY_LDAP_SERVER:
 				c->sec_cfg.ldap_server = cfg_strdup_no_checks(&line);
-				break;
-			case CASE_SECURITY_LDAP_SESSION_TTL:
-				c->sec_cfg.ldap_session_ttl = cfg_seconds(&line, LDAP_SESSION_TTL_MIN, LDAP_SESSION_TTL_MAX);
 				break;
 			case CASE_SECURITY_LDAP_TLS_CA_FILE:
 				c->sec_cfg.ldap_tls_ca_file = cfg_strdup_no_checks(&line);
@@ -3786,6 +3832,9 @@ as_config_init(const char* config_file)
 				break;
 			case CASE_XDR_DC_AUTH_MODE:
 				switch (cfg_find_tok(line.val_tok_1, XDR_DC_AUTH_MODE_OPTS, NUM_XDR_DC_AUTH_MODE_OPTS)) {
+				case CASE_XDR_DC_AUTH_MODE_NONE:
+					dc_cfg->auth_mode = XDR_AUTH_NONE;
+					break;
 				case CASE_XDR_DC_AUTH_MODE_INTERNAL:
 					dc_cfg->auth_mode = XDR_AUTH_INTERNAL;
 					break;
@@ -3794,6 +3843,9 @@ as_config_init(const char* config_file)
 					break;
 				case CASE_XDR_DC_AUTH_MODE_EXTERNAL_INSECURE:
 					dc_cfg->auth_mode = XDR_AUTH_EXTERNAL_INSECURE;
+					break;
+				case CASE_XDR_DC_AUTH_MODE_PKI:
+					dc_cfg->auth_mode = XDR_AUTH_PKI;
 					break;
 				case CASE_NOT_FOUND:
 				default:
@@ -4000,10 +4052,15 @@ as_config_post_process(as_config* c, const char* config_file)
 		cf_crash_nostack(AS_CFG, "must configure at least one namespace");
 	}
 
-	cf_alloc_set_debug(c->debug_allocations, c->indent_allocations);
+	cf_alloc_set_debug(c->debug_allocations, c->indent_allocations,
+			c->salt_allocations);
 
 	// Configuration checks and special defaults that differ between CE and EE.
 	cfg_post_process();
+
+	if (g_config.query_threads % 2 != 0) {
+		cf_crash_nostack(AS_CFG, "'query-threads' must be an even number");
+	}
 
 	// Check the configured file descriptor limit against the system limit.
 	struct rlimit fd_limit;
@@ -4267,8 +4324,16 @@ as_config_post_process(as_config* c, const char* config_file)
 	// Per-namespace config post-processing.
 	//
 
+	uint64_t max_alloc_sz = 0;
+
 	for (int i = 0; i < g_config.n_namespaces; i++) {
 		as_namespace* ns = g_config.namespaces[i];
+
+		if ((ns->xmem_type == CF_XMEM_TYPE_MEM ||
+				ns->xmem_type == CF_XMEM_TYPE_SHMEM) &&
+				ns->index_stage_size > max_alloc_sz) {
+			max_alloc_sz = ns->index_stage_size;
+		}
 
 		client_replica_maps_create(ns);
 
@@ -4411,6 +4476,19 @@ as_config_post_process(as_config* c, const char* config_file)
 
 		sprintf(hist_name, "{%s}-ttl", ns->name);
 		ns->ttl_hist = linear_hist_create(hist_name, LINEAR_HIST_SECONDS, 0, 0, TTL_HIST_NUM_BUCKETS);
+	}
+
+	cf_os_best_practices_check(&g_bad_practices, max_alloc_sz);
+	cfg_best_practices_check();
+	cf_dyn_buf_chomp_char(&g_bad_practices, ',');
+
+	if (g_bad_practices.used_sz != 0) {
+		if (c->enforce_best_practices) {
+			cf_crash_nostack(AS_CFG, "failed best-practices checks - see 'https://docs.aerospike.com/docs/operations/install/linux/bestpractices/index.html'");
+		}
+		else {
+			cf_warning(AS_CFG, "failed best-practices checks - see 'https://docs.aerospike.com/docs/operations/install/linux/bestpractices/index.html'");
+		}
 	}
 }
 
@@ -5023,5 +5101,35 @@ cfg_keep_cap(bool keep, bool* what, int32_t cap)
 
 	if (keep) {
 		cf_process_add_runtime_cap(cap);
+	}
+}
+
+static void
+cfg_best_practices_check(void)
+{
+	as_config* c = &g_config;
+
+	uint32_t n_cpus = (uint32_t)cf_topo_count_cpus();
+	uint32_t min_service_threads = c->n_namespaces_not_inlined != 0 ?
+			n_cpus * 3 : n_cpus;
+
+	if (c->n_service_threads < min_service_threads) {
+		check_failed(&g_bad_practices, "service-threads",
+				"'service-threads' should be at least %u", min_service_threads);
+	}
+
+	uint64_t ns_mem = 0;
+
+	for (uint32_t ns_ix = 0; ns_ix < g_config.n_namespaces; ns_ix++) {
+		ns_mem += g_config.namespaces[ns_ix]->memory_size;
+	}
+
+	uint64_t sys_mem = (uint64_t)sysconf(_SC_PHYS_PAGES) *
+			(uint64_t)sysconf(_SC_PAGESIZE);
+
+	if (ns_mem > sys_mem) {
+		check_failed(&g_bad_practices, "memory-size",
+				"'memory-size' for all namespaces (%lu) exceeds system RAM (%lu)",
+				ns_mem, sys_mem);
 	}
 }

@@ -105,6 +105,7 @@ typedef struct as_config_s {
 	bool			fabric_benchmarks_enabled;
 	bool			health_check_enabled;
 	bool			info_hist_enabled;
+	bool			enforce_best_practices;
 	const char*		feature_key_files[MAX_FEATURE_KEY_FILES];
 	uint32_t		n_feature_key_files; // indirect config
 	uint32_t		n_info_threads;
@@ -119,13 +120,11 @@ typedef struct as_config_s {
 	int				proto_slow_netio_sleep_ms; // dynamic only
 	uint32_t		query_bsize;
 	uint64_t		query_buf_size; // dynamic only
-	uint32_t		query_bufpool_size;
 	bool			query_in_transaction_thr;
 	uint32_t		query_long_q_max_size;
 	bool			query_enable_histogram;
-	bool			partitions_pre_reserved; // query will reserve all partitions up front
 	uint32_t		query_priority;
-	uint64_t		query_sleep_us;
+	uint32_t		query_sleep_us;
 	uint64_t		query_rec_count_bound;
 	bool			query_req_in_query_thread;
 	uint32_t		query_req_max_inflight;
@@ -139,7 +138,6 @@ typedef struct as_config_s {
 	uint32_t		n_scan_threads_limit;
 	uint32_t		n_service_threads;
 	uint32_t		sindex_builder_threads; // secondary index builder thread pool size
-	uint32_t		sindex_gc_max_rate; // Max sindex entries processed per second for gc
 	uint32_t		sindex_gc_period; // same as nsup_period for sindex gc
 	bool			stay_quiesced; // enterprise-only
 	uint32_t		ticker_interval;
@@ -152,6 +150,7 @@ typedef struct as_config_s {
 
 	cf_alloc_debug	debug_allocations; // how to instrument the memory allocation API
 	bool			indent_allocations; // pointer indentation for better double-free detection
+	bool			salt_allocations; // initialize with junk - for internal use only
 
 	//--------------------------------------------
 	// network::service context.

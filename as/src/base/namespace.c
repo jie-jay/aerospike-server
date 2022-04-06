@@ -43,9 +43,7 @@
 #include "base/datamodel.h"
 #include "base/index.h"
 #include "base/proto.h"
-#include "base/truncate.h"
 #include "fabric/partition.h"
-#include "fabric/roster.h"
 #include "sindex/secondary_index.h"
 #include "storage/storage.h"
 
@@ -109,7 +107,7 @@ as_namespace_create(char *name)
 	// Non-0/NULL/false configuration defaults.
 	//
 
-	ns->xmem_type = CF_XMEM_TYPE_UNDEFINED;
+	ns->xmem_type = CF_XMEM_TYPE_MEM;
 
 	ns->cfg_replication_factor = 2;
 	ns->replication_factor = 0; // gets set on rebalance
@@ -146,7 +144,6 @@ as_namespace_create(char *name)
 	ns->storage_write_block_size = 1024 * 1024;
 	ns->storage_defrag_lwm_pct = 50; // defrag if occupancy of block is < 50%
 	ns->storage_defrag_sleep = 1000; // sleep this many microseconds between each wblock
-	ns->storage_defrag_startup_minimum = 10; // defrag until >= 10% disk is writable before joining cluster
 	ns->storage_encryption = AS_ENCRYPTION_AES_128;
 	ns->storage_flush_max_us = 1000 * 1000; // wait this many microseconds before flushing inactive current write buffer (0 = never)
 	ns->storage_max_write_cache = DEFAULT_MAX_WRITE_CACHE;
@@ -154,11 +151,11 @@ as_namespace_create(char *name)
 	ns->storage_post_write_queue = DEFAULT_POST_WRITE_QUEUE; // number of wblocks per device used as post-write cache
 	ns->storage_tomb_raider_sleep = 1000; // sleep this many microseconds between each device read
 
-	ns->sindex_num_partitions = DEFAULT_PARTITIONS_PER_INDEX;
+	ns->sindex_num_partitions = DEFAULT_PARTITIONS_PER_SINDEX;
 
 	ns->geo2dsphere_within_strict = true;
 	ns->geo2dsphere_within_min_level = 1;
-	ns->geo2dsphere_within_max_level = 30;
+	ns->geo2dsphere_within_max_level = 20;
 	ns->geo2dsphere_within_max_cells = 12;
 	ns->geo2dsphere_within_level_mod = 1;
 	ns->geo2dsphere_within_earth_radius_meters = 6371000;  // Wikipedia, mean
@@ -188,14 +185,7 @@ as_namespaces_init(bool cold_start_cmd, uint32_t instance)
 		}
 
 		as_namespace_finish_setup(ns, instance);
-
-		as_truncate_init(ns);
-		as_sindex_init(ns);
 	}
-
-	as_roster_init_smd();
-	as_truncate_init_smd();
-	as_sindex_init_smd(); // before as_storage_init() populates the indexes
 }
 
 

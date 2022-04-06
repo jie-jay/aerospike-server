@@ -1,7 +1,7 @@
 /*
- * node.c
+ * gc.h
  *
- * Copyright (C) 2017-2020 Aerospike, Inc.
+ * Copyright (C) 2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -20,65 +20,50 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/
  */
 
+#pragma once
+
 //==========================================================
 // Includes.
 //
 
-#include "node.h"
+#include "citrusleaf/cf_queue.h"
 
-#include <errno.h>
-#include <stdint.h>
-#include <unistd.h>
-
-#include "citrusleaf/alloc.h"
-
-#include "log.h"
+#include "arenax.h"
 
 
 //==========================================================
-// Inlines & macros.
+// Forward declarations.
 //
 
-static inline uint32_t
-node_id_hash_fn(cf_node id)
-{
-	return (uint32_t)(id >> 32) ^ (uint32_t)id;
-}
+struct as_index_ref_s;
+struct as_index_tree_s;
+struct as_namespace_s;
+
+
+//==========================================================
+// Typedefs & constants.
+//
+
+typedef struct rlist_ele_s {
+	cf_arenax_handle r_h: 40;
+} __attribute__ ((__packed__)) rlist_ele;
 
 
 //==========================================================
 // Public API.
 //
 
-uint32_t
-cf_nodeid_shash_fn(const void* key)
-{
-	return node_id_hash_fn(*(const cf_node*)key);
-}
+void as_sindex_gc_ns_init(struct as_namespace_s* ns);
+void* as_sindex_run_gc(void* udata);
 
-uint32_t
-cf_nodeid_rchash_fn(const void* key, uint32_t key_size)
-{
-	(void)key_size;
+void as_sindex_gc_record(struct as_namespace_s* ns, struct as_index_ref_s* r_ref);
+void as_sindex_gc_tree(struct as_namespace_s* ns, struct as_index_tree_s* tree);
 
-	return node_id_hash_fn(*(const cf_node*)key);
-}
 
-char*
-cf_node_name()
-{
-	char buffer[1024];
-	int res = gethostname(buffer, sizeof(buffer));
+//==========================================================
+// Private API - for enterprise separation only.
+//
 
-	if (res == (int)sizeof(buffer) || (res < 0 && errno == ENAMETOOLONG)) {
-		cf_crash(CF_MISC, "host name too long");
-	}
-
-	if (res < 0) {
-		cf_warning(CF_MISC, "error while determining host name: %d (%s)",
-				errno, cf_strerror(errno));
-		buffer[0] = 0;
-	}
-
-	return cf_strdup(buffer);
-}
+void create_rlist(struct as_namespace_s* ns);
+void push_to_rlist(struct as_namespace_s* ns, struct as_index_ref_s* r_ref);
+void purge_rlist(struct as_namespace_s* ns, cf_queue* rlist);

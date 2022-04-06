@@ -58,17 +58,20 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "aerospike/as_atomic.h"
 #include "citrusleaf/alloc.h"
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_byte_order.h"
 #include "citrusleaf/cf_clock.h"
 #include "citrusleaf/cf_queue.h"
 
+#include "bits.h"
 #include "cf_mutex.h"
 #include "cf_thread.h"
 #include "log.h"
 #include "msg.h"
 #include "node.h"
+#include "pool.h"
 #include "rchash.h"
 #include "shash.h"
 #include "socket.h"
@@ -91,6 +94,8 @@
 #define FABRIC_BUFFER_MAX_SZ		(128 * 1024 * 1024) // used simply for validation
 #define FABRIC_EPOLL_SEND_EVENTS	16
 #define FABRIC_EPOLL_RECV_EVENTS	1
+
+#define FABRIC_MESSAGE_OVERLOAD_COUNT	16
 
 typedef enum {
 	// These values go on the wire, so mind backward compatibility if changing.
@@ -159,10 +164,14 @@ typedef struct fabric_node_s {
 	cf_mutex	fc_hash_lock;
 	cf_shash	*fc_hash; // key is (fabric_connection *), value unused
 
-	cf_mutex	send_idle_fc_queue_lock;
-	cf_queue	send_idle_fc_queue[AS_FABRIC_N_CHANNELS];
-
+	cf_mutex	send_queue_lock[AS_FABRIC_N_CHANNELS];
+	cf_pool_ptr	send_idle_fc_pool[AS_FABRIC_N_CHANNELS];
 	cf_queue	send_queue[AS_FABRIC_N_CHANNELS];
+	uint32_t	send_fc_count[AS_FABRIC_N_CHANNELS];
+
+	cf_mutex	incoming_fc_lock;
+	cf_queue	incoming_overflow[AS_FABRIC_N_CHANNELS];
+	uint32_t	incoming_count[AS_FABRIC_N_CHANNELS];
 
 	uint8_t		send_counts[];
 } fabric_node;
@@ -175,6 +184,7 @@ typedef struct fabric_connection_s {
 	bool failed;
 	bool started_via_connect;
 
+	uint32_t		s_channel;
 	bool			s_cork_bypass;
 	int				s_cork;
 	uint8_t			s_buf[FABRIC_SEND_MEM_SZ];
@@ -262,6 +272,11 @@ static bool fabric_published_endpoints_refresh(void);
 
 static int fabric_dump_fc_reduce_fn(const void *key, void *data, void *udata);
 
+// fc_pool
+static inline fabric_connection *fc_pool_pop(cf_pool_ptr *p);
+static inline void fc_pool_push(cf_pool_ptr *p, fabric_connection *fc);
+static inline bool fc_pool_remove(cf_pool_ptr *p, fabric_connection *fc);
+
 // fabric_node
 static fabric_node *fabric_node_create(cf_node node_id);
 static fabric_node *fabric_node_get(cf_node node_id);
@@ -273,6 +288,7 @@ static void fabric_node_disconnect(cf_node node_id);
 static fabric_connection *fabric_node_connect(fabric_node *node, uint32_t ch);
 static int fabric_node_send(fabric_node *node, msg *m, as_fabric_channel channel);
 static void fabric_node_connect_all(fabric_node *node);
+static void fabric_node_connect_all_channel(fabric_node *node, uint32_t ch);
 static void fabric_node_destructor(void *pnode);
 inline static void fabric_node_reserve(fabric_node *node);
 inline static void fabric_node_release(fabric_node *node);
@@ -282,6 +298,8 @@ static bool fabric_node_is_connect_full(const fabric_node *node);
 
 static int fabric_get_node_list_fn(const void *key, uint32_t keylen, void *data, void *udata);
 static uint32_t fabric_get_node_list(node_list *nl);
+
+static bool fabric_node_is_overloaded(cf_node node_id, as_fabric_channel channel, uint32_t margin);
 
 // fabric_connection
 fabric_connection *fabric_connection_create(cf_socket *sock, cf_sock_addr *peer);
@@ -364,7 +382,7 @@ as_fabric_init()
 			FS_MSG_SCRATCH_SIZE, NULL, NULL);
 
 	g_fabric.node_hash = cf_rchash_create(cf_nodeid_rchash_fn,
-			fabric_node_destructor, sizeof(cf_node), 128, CF_RCHASH_MANY_LOCK);
+			fabric_node_destructor, sizeof(cf_node), 512, CF_RCHASH_MANY_LOCK);
 
 	g_published_endpoint_list = NULL;
 	g_published_endpoint_list_ipv4_only = cf_ip_addr_legacy_only();
@@ -523,6 +541,20 @@ as_fabric_retransmit(cf_node node_id, msg *m, as_fabric_channel channel)
 	return AS_FABRIC_SUCCESS;
 }
 
+bool
+as_fabric_is_overloaded(const cf_node* node_list, uint32_t n_nodes,
+		as_fabric_channel channel, uint32_t margin)
+{
+	for (uint32_t i = 0; i < n_nodes; i++) {
+		if (fabric_node_is_overloaded(node_list[i], channel, margin)) {
+			cf_ticker_warning(AS_FABRIC, "overloaded send-q to node %lx", node_list[i]);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 // TODO - make static registration
 void
 as_fabric_register_msg_fn(msg_type type, const msg_template *mt, size_t mt_sz,
@@ -630,7 +662,7 @@ as_fabric_dump(bool verbose)
 		}
 
 		cf_mutex_lock(&node->fc_hash_lock);
-		cf_info(AS_FABRIC, "   node %lx fds {via_connect={rw=%d ctrl=%d bulk=%d meta=%d} all=%d} live %d q {rw=%d ctrl=%d bulk=%d meta=%d}",
+		cf_info(AS_FABRIC, "   node %lx fds {via_connect={rw=%d ctrl=%d bulk=%d meta=%d} all=%d} live %d q {rw=%u ctrl=%u bulk=%u meta=%u}",
 				node->node_id,
 				node->connect_count[AS_FABRIC_CHANNEL_RW],
 				node->connect_count[AS_FABRIC_CHANNEL_CTRL],
@@ -798,6 +830,29 @@ fabric_dump_fc_reduce_fn(const void *key, void *data, void *udata)
 
 
 //==========================================================
+// fc_pool
+//
+
+static inline fabric_connection *
+fc_pool_pop(cf_pool_ptr *p)
+{
+	return (fabric_connection *)cf_pool_ptr_pop(p);
+}
+
+static inline void
+fc_pool_push(cf_pool_ptr *p, fabric_connection *fc)
+{
+	cf_pool_ptr_push(p, fc);
+}
+
+static inline bool
+fc_pool_remove(cf_pool_ptr *p, fabric_connection *fc)
+{
+	return cf_pool_ptr_remove(p, fc);
+}
+
+
+//==========================================================
 // fabric_node
 //
 
@@ -813,14 +868,17 @@ fabric_node_create(cf_node node_id)
 	node->node_id = node_id;
 	node->live = true;
 
-	cf_mutex_init(&node->send_idle_fc_queue_lock);
+	cf_mutex_init(&node->incoming_fc_lock);
 
 	for (int i = 0; i < AS_FABRIC_N_CHANNELS; i++) {
-		cf_queue_init(&node->send_idle_fc_queue[i], sizeof(fabric_connection *),
-				CF_QUEUE_ALLOCSZ, false);
+		cf_mutex_init(&node->send_queue_lock[i]);
 
+		cf_pool_ptr_init(&node->send_idle_fc_pool[i],
+				g_fabric_connect_limit[i] * 2);
 		cf_queue_init(&node->send_queue[i], sizeof(msg *), CF_QUEUE_ALLOCSZ,
-				true);
+				false);
+		cf_queue_init(&node->incoming_overflow[i], sizeof(fabric_connection *),
+				CF_QUEUE_ALLOCSZ, false);
 	}
 
 	cf_mutex_init(&node->connect_lock);
@@ -837,16 +895,11 @@ fabric_node_create(cf_node node_id)
 static fabric_node *
 fabric_node_get(cf_node node_id)
 {
-	fabric_node *node;
+	fabric_node *n = NULL;
 
-	int rv = cf_rchash_get(g_fabric.node_hash, &node_id, sizeof(cf_node),
-			(void **)&node);
+	cf_rchash_get(g_fabric.node_hash, &node_id, sizeof(cf_node), (void **)&n);
 
-	if (rv != CF_RCHASH_OK) {
-		return NULL;
-	}
-
-	return node;
+	return n;
 }
 
 static fabric_node *
@@ -918,25 +971,35 @@ fabric_node_disconnect(cf_node node_id)
 
 	cf_mutex_unlock(&node->fc_hash_lock);
 
-	cf_mutex_lock(&node->send_idle_fc_queue_lock);
-
 	for (int i = 0; i < AS_FABRIC_N_CHANNELS; i++) {
-		while (true) {
-			fabric_connection *fc;
+		while (node->send_fc_count[i] != 0) {
+			fabric_connection *fc = fc_pool_pop(&node->send_idle_fc_pool[i]);
 
-			int rv = cf_queue_pop(&node->send_idle_fc_queue[i], &fc,
-					CF_QUEUE_NOWAIT);
-
-			if (rv != CF_QUEUE_OK) {
-				break;
+			if (fc == NULL) {
+				sched_yield();
+				continue;
 			}
 
 			fabric_connection_send_unassign(fc);
 			fabric_connection_release(fc);
 		}
-	}
 
-	cf_mutex_unlock(&node->send_idle_fc_queue_lock);
+		cf_mutex_lock(&node->incoming_fc_lock);
+
+		while (true) {
+			fabric_connection *fc = NULL;
+
+			cf_queue_pop(&node->incoming_overflow[i], &fc, CF_QUEUE_NOWAIT);
+
+			if (fc == NULL) {
+				break;
+			}
+
+			fabric_connection_release(fc); // for delete from incoming_overflow
+		}
+
+		cf_mutex_unlock(&node->incoming_fc_lock);
+	}
 
 	fabric_node_release(node); // from fabric_node_pop()
 }
@@ -1022,6 +1085,7 @@ fabric_node_connect(fabric_node *node, uint32_t ch)
 
 	fc->s_msg_in_progress = m;
 	fc->started_via_connect = true;
+	fc->s_channel = ch;
 
 	uint32_t ix = (cf_atomic32_incr(&g_n_channel_connects[ch]) - 1) %
 			g_config.n_fabric_channel_recv_pools[ch];
@@ -1050,26 +1114,29 @@ fabric_node_send(fabric_node *node, msg *m, as_fabric_channel channel)
 	}
 
 	while (true) {
-		// Sync with fabric_connection_process_writable() to avoid non-empty
-		// send_queue with every fc being in send_idle_fc_queue.
-		cf_mutex_lock(&node->send_idle_fc_queue_lock);
+		fabric_connection *fc =
+				fc_pool_pop(&node->send_idle_fc_pool[(int)channel]);
 
-		fabric_connection *fc;
-		int rv = cf_queue_pop(&node->send_idle_fc_queue[(int)channel], &fc,
-				CF_QUEUE_NOWAIT);
+		if (fc == NULL) {
+			// Sync with fabric_connection_process_writable() to avoid non-empty
+			// send_queue with every fc being in send_idle_fc_queue.
+			cf_mutex_lock(&node->send_queue_lock[(int)channel]);
 
-		if (rv != CF_QUEUE_OK) {
-			cf_queue_push(&node->send_queue[(int)channel], &m);
-			cf_mutex_unlock(&node->send_idle_fc_queue_lock);
+			fc = fc_pool_pop(&node->send_idle_fc_pool[(int)channel]);
 
-			if (! node->connect_full) {
-				fabric_node_connect_all(node);
+			if (fc == NULL) {
+				cf_queue_push(&node->send_queue[(int)channel], &m);
+				cf_mutex_unlock(&node->send_queue_lock[(int)channel]);
+
+				if (! node->connect_full) {
+					fabric_node_connect_all_channel(node, (uint32_t)channel);
+				}
+
+				break;
 			}
 
-			break;
+			cf_mutex_unlock(&node->send_queue_lock[(int)channel]);
 		}
-
-		cf_mutex_unlock(&node->send_idle_fc_queue_lock);
 
 		if ((! cf_socket_exists(&fc->sock)) || fc->failed) {
 			fabric_connection_send_unassign(fc);
@@ -1080,12 +1147,8 @@ fabric_node_send(fabric_node *node, msg *m, as_fabric_channel channel)
 		fc->s_msg_in_progress = m;
 
 		// Wake up.
-		if (fc->send_ptr) {
-			fabric_connection_send_rearm(fc); // takes fc ref
-		}
-		else {
-			fabric_connection_send_assign(fc); // takes fc ref
-		}
+		cf_assert(fc->send_ptr != NULL, AS_FABRIC, "send_ptr NULL");
+		fabric_connection_send_rearm(fc); // takes fc ref
 
 		break;
 	}
@@ -1101,33 +1164,39 @@ fabric_node_connect_all(fabric_node *node)
 	}
 
 	for (uint32_t ch = 0; ch < AS_FABRIC_N_CHANNELS; ch++) {
-		uint32_t n = g_fabric_connect_limit[ch] - node->connect_count[ch];
+		fabric_node_connect_all_channel(node, ch);
+	}
+}
 
-		for (uint32_t i = 0; i < n; i++) {
-			fabric_connection *fc = fabric_node_connect(node, ch);
+static void
+fabric_node_connect_all_channel(fabric_node *node, uint32_t ch)
+{
+	uint32_t n = g_fabric_connect_limit[ch] - node->connect_count[ch];
 
-			if (! fc) {
-				break;
-			}
+	for (uint32_t i = 0; i < n; i++) {
+		fabric_connection *fc = fabric_node_connect(node, ch);
 
-			// TLS connections are one-way. Outgoing connections are for
-			// outgoing data.
-			if (fc->sock.state == CF_SOCKET_STATE_NON_TLS) {
-				fabric_recv_thread_pool_add_fc(NULL, fc);
-				cf_detail(AS_FABRIC, "{%16lX, %u} activated", fabric_connection_get_id(fc), fc->sock.fd);
-
-				if (channel_nagle[ch]) {
-					fc->s_cork_bypass = true;
-					cf_socket_enable_nagle(&fc->sock);
-				}
-			}
-			else {
-				fc->s_cork_bypass = true;
-			}
-
-			// Takes the remaining ref for send_poll and idle queue.
-			fabric_connection_send_assign(fc);
+		if (! fc) {
+			break;
 		}
+
+		// TLS connections are one-way. Outgoing connections are for
+		// outgoing data.
+		if (fc->sock.state == CF_SOCKET_STATE_NON_TLS) {
+			fabric_recv_thread_pool_add_fc(NULL, fc);
+			cf_detail(AS_FABRIC, "{%16lX, %u} activated", fabric_connection_get_id(fc), fc->sock.fd);
+
+			if (channel_nagle[ch]) {
+				fc->s_cork_bypass = true;
+				cf_socket_enable_nagle(&fc->sock);
+			}
+		}
+		else {
+			fc->s_cork_bypass = true;
+		}
+
+		// Takes the remaining ref for send_poll and idle queue.
+		fabric_connection_send_assign(fc);
 	}
 }
 
@@ -1139,8 +1208,8 @@ fabric_node_destructor(void *pnode)
 
 	for (int i = 0; i < AS_FABRIC_N_CHANNELS; i++) {
 		// send_idle_fc_queue section.
-		cf_assert(cf_queue_sz(&node->send_idle_fc_queue[i]) == 0, AS_FABRIC, "send_idle_fc_queue not empty as expected");
-		cf_queue_destroy(&node->send_idle_fc_queue[i]);
+		cf_assert(cf_pool_ptr_count(&node->send_idle_fc_pool[i]) == 0, AS_FABRIC, "send_idle_fc_queue not empty as expected");
+		cf_pool_ptr_destroy(&node->send_idle_fc_pool[i]);
 
 		// send_queue section.
 		while (true) {
@@ -1155,9 +1224,11 @@ fabric_node_destructor(void *pnode)
 		}
 
 		cf_queue_destroy(&node->send_queue[i]);
+		cf_queue_destroy(&node->incoming_overflow[i]);
+		cf_mutex_destroy(&node->send_queue_lock[i]);
 	}
 
-	cf_mutex_destroy(&node->send_idle_fc_queue_lock);
+	cf_mutex_destroy(&node->incoming_fc_lock);
 
 	// connection_hash section.
 	cf_assert(cf_shash_get_size(node->fc_hash) == 0, AS_FABRIC, "fc_hash not empty as expected");
@@ -1261,6 +1332,26 @@ fabric_get_node_list(node_list *nl)
 	return nl->count;
 }
 
+static bool
+fabric_node_is_overloaded(cf_node node_id, as_fabric_channel channel,
+		uint32_t margin)
+{
+	uint32_t threshold = FABRIC_MESSAGE_OVERLOAD_COUNT + margin;
+	fabric_node *node = NULL;
+
+	if (cf_rchash_get(g_fabric.node_hash, &node_id, sizeof(cf_node),
+			(void **)&node) == CF_RCHASH_OK) {
+		uint32_t sz = cf_queue_sz(&node->send_queue[channel]);
+
+		cf_rc_release(node);
+
+		return sz >= threshold;
+	}
+
+	// No node case - we had the node and now we don't - proceed anyway.
+	return false;
+}
+
 
 //==========================================================
 // fabric_connection
@@ -1331,19 +1422,9 @@ static void
 fabric_connection_release(fabric_connection *fc)
 {
 	if (cf_rc_release(fc) == 0) {
-		if (fc->s_msg_in_progress) {
-			// First message (s_count == 0) is initial M_TYPE_FABRIC message
-			// and does not need to be saved.
-			if (! fc->started_via_connect || fc->s_count != 0) {
-				cf_queue_push(&fc->node->send_queue[fc->pool->pool_id],
-						&fc->s_msg_in_progress);
-			}
-			else {
-				as_fabric_msg_put(fc->s_msg_in_progress);
-			}
-		}
+		fabric_connection_reroute_msg(fc);
 
-		if (fc->node) {
+		if (fc->node != NULL) {
 			fabric_node_release(fc->node);
 			fc->node = NULL;
 		}
@@ -1363,7 +1444,7 @@ fabric_connection_release(fabric_connection *fc)
 inline static cf_node
 fabric_connection_get_id(const fabric_connection *fc)
 {
-	if (fc->node) {
+	if (fc->node != NULL) {
 		return fc->node->node_id;
 	}
 
@@ -1425,6 +1506,8 @@ fabric_connection_send_assign(fabric_connection *fc)
 
 	fc->send_ptr = se;
 
+	as_incr_uint32(&fc->node->send_fc_count[fc->s_channel]);
+
 	cf_mutex_unlock(&g_fabric.send_lock);
 
 	cf_poll_add_socket(se->poll, &fc->sock, EPOLLOUT | DEFAULT_EVENTS, fc);
@@ -1459,6 +1542,8 @@ fabric_connection_send_unassign(fabric_connection *fc)
 	send_entry_insert(&g_fabric.send_head, se);
 
 	fc->send_ptr = NULL;
+
+	as_decr_uint32(&fc->node->send_fc_count[fc->s_channel]);
 
 	cf_mutex_unlock(&g_fabric.send_lock);
 }
@@ -1500,27 +1585,54 @@ fabric_connection_disconnect(fabric_connection *fc)
 
 	cf_mutex_unlock(&node->fc_hash_lock);
 
+	uint32_t ch = fc->pool->pool_id;
+
 	if (fc->started_via_connect) {
 		cf_mutex_lock(&node->connect_lock);
 
-		cf_atomic32_decr(&node->connect_count[fc->pool->pool_id]);
+		cf_atomic32_decr(&node->connect_count[ch]);
 		node->connect_full = false;
 
 		cf_mutex_unlock(&node->connect_lock);
 	}
 
-	cf_mutex_lock(&node->send_idle_fc_queue_lock);
+	while (true) {
+		cf_mutex_lock(&node->send_queue_lock[ch]);
+		cf_mutex_lock(&node->incoming_fc_lock);
 
-	if (cf_queue_delete(&node->send_idle_fc_queue[fc->pool->pool_id], &fc,
-			true) == CF_QUEUE_OK) {
-		fabric_connection_send_unassign(fc);
-		fabric_connection_release(fc); // for delete from send_idle_fc_queue
+		if (fc_pool_remove(&node->send_idle_fc_pool[ch], fc)) {
+			fabric_connection_send_unassign(fc);
+			fabric_connection_release(fc); // for delete from send_idle_fc_queue
+		}
+		else if (! fc->started_via_connect) {
+			if (cf_queue_delete(&node->incoming_overflow[ch], &fc, true) ==
+					CF_QUEUE_OK) {
+				cf_mutex_unlock(&node->incoming_fc_lock);
+				cf_mutex_unlock(&node->send_queue_lock[ch]);
+				fabric_connection_release(fc); // for delete from incoming_overflow
+				break;
+			}
+		}
+
+		if (! fc->started_via_connect) {
+			fabric_connection *move_fc;
+
+			if (cf_queue_pop(&node->incoming_overflow[ch], &move_fc,
+					CF_QUEUE_NOWAIT) == CF_QUEUE_OK) {
+				fabric_connection_send_assign(move_fc);
+			}
+			else {
+				node->incoming_count[ch]--;
+			}
+		}
+
+		cf_mutex_unlock(&node->incoming_fc_lock);
+		cf_mutex_unlock(&node->send_queue_lock[ch]);
+		break;
 	}
 
-	cf_mutex_unlock(&node->send_idle_fc_queue_lock);
-
 	cf_detail(AS_FABRIC, "fabric_connection_disconnect(%p) {pool=%u id=%lx fd=%u}",
-			fc, fc->pool ? fc->pool->pool_id : 0,
+			fc, fc->pool ? ch : 0,
 			node ? node->node_id : (cf_node)0, fc->sock.fd);
 
 	fabric_connection_release(fc); // for delete from node->fc_hash
@@ -1539,7 +1651,7 @@ fabric_connection_set_keepalive_options(fabric_connection *fc)
 static void
 fabric_connection_reroute_msg(fabric_connection *fc)
 {
-	if (! fc->s_msg_in_progress) {
+	if (fc->s_msg_in_progress == NULL) {
 		return;
 	}
 
@@ -1633,9 +1745,7 @@ fabric_connection_process_writable(fabric_connection *fc)
 	fabric_node *node = fc->node;
 	uint32_t pool = fc->pool->pool_id;
 
-	if (! fc->s_msg_in_progress) {
-		// TODO - Change to load op when atomic API is ready.
-		// Also should be rare or not even happen in x86_64.
+	if (fc->s_msg_in_progress == NULL && fc->s_count != 0) {
 		cf_warning(AS_FABRIC, "fc(%p)->s_msg_in_progress NULL on entry", fc);
 		return false;
 	}
@@ -1643,47 +1753,44 @@ fabric_connection_process_writable(fabric_connection *fc)
 	fabric_connection_cork(fc);
 
 	while (true) {
-		if (! fabric_connection_send_progress(fc)) {
-			return false;
+		if (fc->s_msg_in_progress != NULL) {
+			if (! fabric_connection_send_progress(fc)) {
+				return false;
+			}
+
+			if (fc->s_msg_in_progress != NULL) {
+				fabric_connection_send_rearm(fc);
+				return true;
+			}
 		}
 
-		if (fc->s_msg_in_progress) {
-			fabric_connection_send_rearm(fc);
-			return true;
+		cf_mutex_lock(&node->send_queue_lock[pool]);
+
+		if (! fc->node->live || fc->failed) {
+			cf_mutex_unlock(&node->send_queue_lock[pool]);
+			return false;
 		}
 
 		if (cf_queue_pop(&node->send_queue[pool], &fc->s_msg_in_progress,
 				CF_QUEUE_NOWAIT) != CF_QUEUE_OK) {
-			break;
+			cf_mutex_unlock(&node->send_queue_lock[pool]);
+
+			fabric_connection_uncork(fc);
+
+			cf_mutex_lock(&node->send_queue_lock[pool]);
+
+			if (cf_queue_pop(&node->send_queue[pool], &fc->s_msg_in_progress,
+					CF_QUEUE_NOWAIT) != CF_QUEUE_OK) {
+				fc_pool_push(&node->send_idle_fc_pool[pool], fc);
+				cf_mutex_unlock(&node->send_queue_lock[pool]);
+				return true;
+			}
 		}
+
+		cf_mutex_unlock(&node->send_queue_lock[pool]);
 	}
 
-	fabric_connection_uncork(fc);
-
-	if (! fc->node->live || fc->failed) {
-		return false;
-	}
-
-	// Try with bigger lock block to sync with as_fabric_send().
-	cf_mutex_lock(&node->send_idle_fc_queue_lock);
-
-	if (! fc->node->live || fc->failed) {
-		cf_mutex_unlock(&node->send_idle_fc_queue_lock);
-		return false;
-	}
-
-	if (cf_queue_pop(&node->send_queue[pool], &fc->s_msg_in_progress,
-			CF_QUEUE_NOWAIT) == CF_QUEUE_EMPTY) {
-		cf_queue_push(&node->send_idle_fc_queue[pool], &fc);
-		cf_mutex_unlock(&node->send_idle_fc_queue_lock);
-		return true;
-	}
-
-	cf_mutex_unlock(&node->send_idle_fc_queue_lock);
-
-	fabric_connection_send_rearm(fc);
-
-	return true;
+	return false; // unreachable
 }
 
 // Return true on success.
@@ -1708,47 +1815,58 @@ fabric_connection_process_fabric_msg(fabric_connection *fc, const msg *m)
 		return false;
 	}
 
-	uint32_t pool_id = AS_FABRIC_N_CHANNELS; // illegal value
+	uint32_t ch = AS_FABRIC_N_CHANNELS; // illegal value
 
-	msg_get_uint32(m, FS_CHANNEL, &pool_id);
+	msg_get_uint32(m, FS_CHANNEL, &ch);
 
-	if (pool_id >= AS_FABRIC_N_CHANNELS) {
+	if (ch >= AS_FABRIC_N_CHANNELS) {
 		fabric_node_release(node); // from cf_rchash_get
 		return false;
 	}
 
+	fc->s_channel = ch;
 	fc->r_sz = 0;
 	fc->r_buf_sz = 0;
 
-	uint32_t ix = (cf_atomic32_incr(&g_n_channel_connects[pool_id]) - 1) %
-			g_config.n_fabric_channel_recv_pools[pool_id];
+	uint32_t ix = (cf_atomic32_incr(&g_n_channel_connects[ch]) - 1) %
+			g_config.n_fabric_channel_recv_pools[ch];
 
 	// fc->pool needs to be set before placing into send_idle_fc_queue.
-	fabric_recv_thread_pool_add_fc(&g_fabric.recv_pool[pool_id][ix], fc);
+	fabric_recv_thread_pool_add_fc(&g_fabric.recv_pool[ch][ix], fc);
 
 	// TLS connections are one-way. Incoming connections are for
 	// incoming data.
 	if (fc->sock.state == CF_SOCKET_STATE_NON_TLS) {
-		if (channel_nagle[pool_id]) {
+		if (channel_nagle[ch]) {
 			fc->s_cork_bypass = true;
 			cf_socket_enable_nagle(&fc->sock);
 		}
 
-		cf_mutex_lock(&node->send_idle_fc_queue_lock);
+		cf_mutex_lock(&node->send_queue_lock[ch]);
 
-		if (node->live && ! fc->failed) {
-			fabric_connection_reserve(fc); // for send poll & idleQ
+		while (node->live && ! fc->failed) {
+			fabric_connection_reserve(fc); // for send poll & idleQ & overflow
 
-			if (cf_queue_pop(&node->send_queue[pool_id], &fc->s_msg_in_progress,
-					CF_QUEUE_NOWAIT) == CF_QUEUE_EMPTY) {
-				cf_queue_push(&node->send_idle_fc_queue[pool_id], &fc);
+			cf_mutex_lock(&node->incoming_fc_lock);
+
+			if (node->incoming_count[ch] >= g_fabric_connect_limit[ch]) {
+				cf_queue_push(&node->incoming_overflow[ch], &fc);
+				cf_mutex_unlock(&node->incoming_fc_lock);
+				break;
 			}
-			else {
-				fabric_connection_send_assign(fc);
-			}
+
+			node->incoming_count[ch]++;
+
+			cf_mutex_unlock(&node->incoming_fc_lock);
+
+			cf_queue_pop(&node->send_queue[ch], &fc->s_msg_in_progress,
+					CF_QUEUE_NOWAIT);
+			fabric_connection_send_assign(fc);
+
+			break;
 		}
 
-		cf_mutex_unlock(&node->send_idle_fc_queue_lock);
+		cf_mutex_unlock(&node->send_queue_lock[ch]);
 	}
 	else {
 		fc->s_cork_bypass = true;

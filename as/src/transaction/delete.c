@@ -1,7 +1,7 @@
 /*
  * delete.c
  *
- * Copyright (C) 2016-2020 Aerospike, Inc.
+ * Copyright (C) 2016-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -46,6 +46,7 @@
 #include "base/set_index.h"
 #include "base/transaction.h"
 #include "base/transaction_policy.h"
+#include "fabric/fabric.h"
 #include "fabric/partition.h"
 #include "sindex/secondary_index.h"
 #include "storage/storage.h"
@@ -464,8 +465,8 @@ drop_master(as_transaction* tr, as_index_ref* r_ref, rw_request* rw)
 
 	// Apply predexp metadata filter if present.
 
-	as_exp* predexp = NULL;
-	int result = build_predexp_and_filter_meta(tr, r, &predexp);
+	as_exp* filter_exp = NULL;
+	int result = handle_meta_filter(tr, r, &filter_exp);
 
 	if (result != 0) {
 		as_record_done(r_ref, ns);
@@ -480,23 +481,30 @@ drop_master(as_transaction* tr, as_index_ref* r_ref, rw_request* rw)
 		return TRANS_DONE_ERROR;
 	}
 
+	// Fire and forget can overload the fabric send queues - check.
+	if (respond_on_master_complete(tr) &&
+			as_fabric_is_overloaded(rw->dest_nodes, rw->n_dest_nodes,
+					AS_FABRIC_CHANNEL_RW, 8)) {
+		tr->flags |= AS_TRANSACTION_FLAG_SWITCH_TO_COMMIT_ALL;
+	}
+
 	bool check_key = as_transaction_has_key(tr);
 
-	if (ns->storage_data_in_memory || predexp != NULL || check_key) {
+	if (ns->storage_data_in_memory || filter_exp != NULL || check_key) {
 		as_storage_rd rd;
 		as_storage_record_open(ns, r, &rd);
 
 		// Apply predexp record bins filter if present.
-		if (predexp != NULL) {
-			if ((result = predexp_read_and_filter_bins(&rd, predexp)) != 0) {
-				as_exp_destroy(predexp);
+		if (filter_exp != NULL) {
+			if ((result = read_and_filter_bins(&rd, filter_exp)) != 0) {
+				destroy_filter_exp(tr, filter_exp);
 				as_storage_record_close(&rd);
 				as_record_done(r_ref, ns);
 				tr->result_code = result;
 				return TRANS_DONE_ERROR;
 			}
 
-			as_exp_destroy(predexp);
+			destroy_filter_exp(tr, filter_exp);
 		}
 
 		// Check the key if required.
@@ -509,11 +517,11 @@ drop_master(as_transaction* tr, as_index_ref* r_ref, rw_request* rw)
 			return TRANS_DONE_ERROR;
 		}
 
-		if (ns->storage_data_in_memory) {
-			delete_adjust_sindex(&rd);
-		}
-
 		as_storage_record_close(&rd);
+
+		if (ns->storage_data_in_memory) {
+			remove_from_sindex(ns, r_ref);
+		}
 	}
 
 	as_set_index_delete(ns, tree, as_index_get_set_id(r), r_ref->r_h);

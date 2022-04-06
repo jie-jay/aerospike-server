@@ -1,7 +1,7 @@
 /*
  * udf.c
  *
- * Copyright (C) 2016-2020 Aerospike, Inc.
+ * Copyright (C) 2016-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -62,6 +62,7 @@
 #include "base/udf_cask.h"
 #include "base/udf_record.h"
 #include "base/xdr.h"
+#include "fabric/fabric.h"
 #include "fabric/partition.h"
 #include "sindex/secondary_index.h"
 #include "storage/storage.h"
@@ -135,6 +136,7 @@ static int udf_apply_record(udf_call* call, as_rec* rec, as_result* result);
 static bool udf_timer_timedout(const as_timer* timer);
 static uint64_t udf_timer_timeslice(const as_timer* timer);
 static uint8_t udf_master_write(udf_record* urecord, rw_request* rw);
+static void udf_update_sindex(udf_record* urecord);
 
 static void udf_master_failed(udf_record* urecord, as_rec* urec, as_result* result, uint8_t result_code, cf_dyn_buf* db);
 static void udf_master_done(udf_record* urecord, as_rec* urec, as_result* result, cf_dyn_buf* db);
@@ -323,7 +325,7 @@ as_udf_start(as_transaction* tr)
 	}
 
 	// Don't know if UDF is read or delete - check that we aren't backed up.
-	if (as_storage_overloaded(tr->rsv.ns)) {
+	if (as_storage_overloaded(tr->rsv.ns, 0, "udf")) {
 		tr->result_code = AS_ERR_DEVICE_OVERLOAD;
 		send_udf_response(tr, NULL);
 		return TRANS_DONE_ERROR;
@@ -568,7 +570,7 @@ send_udf_response(as_transaction* tr, cf_dyn_buf* db)
 {
 	// Paranoia - shouldn't get here on losing race with timeout.
 	if (tr->from.any == NULL) {
-		cf_warning(AS_RW, "transaction origin %u has null 'from'", tr->origin);
+		cf_warning(AS_UDF, "transaction origin %u has null 'from'", tr->origin);
 		return;
 	}
 
@@ -609,14 +611,14 @@ send_udf_response(as_transaction* tr, cf_dyn_buf* db)
 		break;
 	case FROM_IUDF:
 		if (db != NULL && db->used_sz != 0) {
-			cf_crash(AS_RW, "unexpected - internal udf has response");
+			cf_crash(AS_UDF, "unexpected - internal udf has response");
 		}
 		tr->from.iudf_orig->cb(tr->from.iudf_orig->udata, tr->result_code);
 		BENCHMARK_NEXT_DATA_POINT(tr, udf_sub, response);
 		udf_sub_udf_update_stats(tr->rsv.ns, tr->result_code);
 		break;
 	default:
-		cf_crash(AS_RW, "unexpected transaction origin %u", tr->origin);
+		cf_crash(AS_UDF, "unexpected transaction origin %u", tr->origin);
 		break;
 	}
 
@@ -648,7 +650,7 @@ udf_timeout_cb(rw_request* rw)
 		udf_sub_udf_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
 		break;
 	default:
-		cf_crash(AS_RW, "unexpected transaction origin %u", rw->origin);
+		cf_crash(AS_UDF, "unexpected transaction origin %u", rw->origin);
 		break;
 	}
 
@@ -663,7 +665,7 @@ udf_timeout_cb(rw_request* rw)
 static transaction_status
 udf_master(rw_request* rw, as_transaction* tr)
 {
-	CF_ALLOC_SET_NS_ARENA(tr->rsv.ns);
+	CF_ALLOC_SET_NS_ARENA_DIM(tr->rsv.ns);
 
 	udf_def def;
 	udf_call call = { .def = &def, .tr = tr };
@@ -858,32 +860,30 @@ open_existing_record(udf_record* urecord)
 	as_record* r = urecord->r_ref->r;
 
 	int rv;
-	as_exp* predexp = NULL;
+	as_exp* filter_exp = NULL;
 
-	// Apply predexp metadata filter if present.
-	if (tr->origin != FROM_IUDF && as_record_is_live(r) &&
-			(rv = build_predexp_and_filter_meta(tr, r, &predexp)) != 0) {
+	// Handle metadata filter if present.
+	if (as_record_is_live(r) &&
+			(rv = handle_meta_filter(tr, r, &filter_exp)) != 0) {
 		return (uint8_t)rv;
 	}
 
-	// Apply predexp record bins filter if present.
-	if (predexp != NULL || (tr->origin == FROM_IUDF &&
-			tr->from.iudf_orig->predexp != NULL)) {
+	// Apply record bins filter if present.
+	if (filter_exp != NULL) {
 		if ((rv = udf_record_load(urecord)) != 0) {
 			cf_warning(AS_UDF, "record failed load");
-			as_exp_destroy(predexp);
+			destroy_filter_exp(tr, filter_exp);
 			return (uint8_t)rv;
 		}
 
-		as_exp_ctx predargs = { .ns = ns, .r = r, .rd = urecord->rd };
+		as_exp_ctx ctx = { .ns = ns, .r = r, .rd = urecord->rd };
 
-		if (! as_exp_matches_record(tr->origin == FROM_IUDF ?
-				tr->from.iudf_orig->predexp : predexp, &predargs)) {
-			as_exp_destroy(predexp);
+		if (! as_exp_matches_record(filter_exp, &ctx)) {
+			destroy_filter_exp(tr, filter_exp);
 			return AS_ERR_FILTERED_OUT;
 		}
 
-		as_exp_destroy(predexp);
+		destroy_filter_exp(tr, filter_exp);
 	}
 
 	if (as_transaction_has_key(tr)) {
@@ -976,6 +976,13 @@ udf_master_write(udf_record* urecord, rw_request* rw)
 		return AS_ERR_UNAVAILABLE;
 	}
 
+	// Fire and forget can overload the fabric send queues - check.
+	if (respond_on_master_complete(tr) &&
+			as_fabric_is_overloaded(rw->dest_nodes, rw->n_dest_nodes,
+					AS_FABRIC_CHANNEL_RW, 0)) {
+		tr->flags |= AS_TRANSACTION_FLAG_SWITCH_TO_COMMIT_ALL;
+	}
+
 	// Will we need a pickle?
 	rd->keep_pickle = rw->n_dest_nodes != 0;
 
@@ -1050,26 +1057,15 @@ udf_master_write(udf_record* urecord, rw_request* rw)
 			as_single_bin_copy(as_index_get_single_bin(r), rd->bins);
 		}
 		else {
-			if (record_has_sindex(r, ns) &&
-					// Adjust sindex, looking at old and new bins.
-					write_sindex_update(ns, as_index_get_set_name(r, ns),
-							&r->keyd, urecord->old_bins, urecord->n_old_bins,
-							rd->bins, rd->n_bins)) {
-				tr->flags |= AS_TRANSACTION_FLAG_SINDEX_TOUCHED;
-			}
-
+			udf_update_sindex(urecord);
 			as_bin_destroy_all(urecord->cleanup_bins, urecord->n_cleanup_bins);
 			as_storage_rd_update_bin_space(rd);
 		}
 
 		as_storage_record_adjust_mem_stats(rd, urecord->old_memory_bytes);
 	}
-	else if (! ns->single_bin && record_has_sindex(r, ns) &&
-			// Adjust sindex, looking at old and new bins.
-			write_sindex_update(ns, as_index_get_set_name(r, ns), &r->keyd,
-					urecord->old_bins, urecord->n_old_bins, rd->bins,
-					rd->n_bins)) {
-		tr->flags |= AS_TRANSACTION_FLAG_SINDEX_TOUCHED;
+	else {
+		udf_update_sindex(urecord);
 	}
 
 	tr->generation = r->generation;
@@ -1089,6 +1085,22 @@ udf_master_write(udf_record* urecord, rw_request* rw)
 	will_replicate(r, ns);
 
 	return AS_OK;
+}
+
+static void
+udf_update_sindex(udf_record* urecord) {
+	as_namespace* ns = urecord->tr->rsv.ns;
+	as_storage_rd* rd = urecord->rd;
+	as_record* r = rd->r;
+
+	if (set_has_sindex(r, ns)) {
+		update_sindex(ns, urecord->r_ref, urecord->old_bins,
+				urecord->n_old_bins, rd->bins, rd->n_bins);
+	}
+	else {
+		// Sindex drop will leave in_sindex bit. Good opportunity to clear.
+		as_index_clear_in_sindex(r);
+	}
 }
 
 

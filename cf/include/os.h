@@ -1,7 +1,7 @@
 /*
- * scan_manager.h
+ * os.h
  *
- * Copyright (C) 2019 Aerospike, Inc.
+ * Copyright (C) 2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -27,52 +27,59 @@
 //
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
-#include "citrusleaf/cf_queue.h"
-
-#include "cf_mutex.h"
-
-
-//==========================================================
-// Forward declarations.
-//
-
-struct as_mon_jobstat_s;
-struct as_scan_job_s;
+#include "dynbuf.h"
 
 
 //==========================================================
 // Typedefs & constants.
 //
 
-typedef struct as_scan_manager_s {
-	cf_mutex lock;
-	cf_queue* active_jobs;
-	cf_queue* finished_jobs;
-} as_scan_manager;
+typedef enum {
+	CF_OS_FILE_RES_OK,
+	CF_OS_FILE_RES_NOT_FOUND,
+	CF_OS_FILE_RES_ERROR
+} cf_os_file_res;
+
+#define CF_OS_OPEN_MODE_USR (S_IRUSR | S_IWUSR)
+#define CF_OS_OPEN_MODE_GRP (CF_OS_OPEN_MODE_USR | S_IRGRP | S_IWGRP)
 
 
 //==========================================================
-// Globals.
+// Public API - file permissions.
 //
 
-extern uint32_t g_n_threads;
+void cf_os_use_group_perms(bool use);
+bool cf_os_is_using_group_perms(void);
+
+static inline mode_t
+cf_os_base_perms(void)
+{
+	return cf_os_is_using_group_perms() ?
+			CF_OS_OPEN_MODE_GRP : CF_OS_OPEN_MODE_USR;
+}
+
+static inline mode_t
+cf_os_log_perms(void)
+{
+	return cf_os_base_perms() | S_IRGRP | S_IROTH;
+}
 
 
 //==========================================================
-// Public API.
+// Public API - read system files.
 //
 
-void as_scan_manager_init(void);
-int as_scan_manager_start_job(struct as_scan_job_s* _job);
-void as_scan_manager_add_job_thread(struct as_scan_job_s* _job);
-void as_scan_manager_add_max_job_threads(struct as_scan_job_s* _job);
-void as_scan_manager_finish_job(struct as_scan_job_s* _job);
-void as_scan_manager_abandon_job(struct as_scan_job_s* _job, int reason);
-bool as_scan_manager_abort_job(uint64_t trid);
-uint32_t as_scan_manager_abort_all_jobs(void);
-void as_scan_manager_limit_finished_jobs(void);
-struct as_mon_jobstat_s* as_scan_manager_get_job_info(uint64_t trid);
-struct as_mon_jobstat_s* as_scan_manager_get_info(int* size);
-uint32_t as_scan_manager_get_active_job_count(void);
+cf_os_file_res cf_os_read_file(const char* path, void* buf, size_t* limit);
+cf_os_file_res cf_os_read_int_from_file(const char* path, int64_t* val);
+
+
+//==========================================================
+// Public API - best practices.
+//
+
+void cf_os_best_practices_check(cf_dyn_buf* db, uint64_t max_alloc_sz);

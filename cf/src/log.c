@@ -45,6 +45,7 @@
 #include "citrusleaf/cf_digest.h"
 
 #include "cf_mutex.h"
+#include "os.h"
 #include "shash.h"
 
 #include "warnings.h"
@@ -69,6 +70,7 @@ static const char* context_strings[] = {
 		"arenax",
 		"hardware",
 		"msg",
+		"os",
 		"rbuffer",
 		"socket",
 		"tls",
@@ -79,6 +81,7 @@ static const char* context_strings[] = {
 		"aggr",
 		"appeal",
 		"as",
+		"audit",
 		"batch",
 		"bin",
 		"config",
@@ -167,9 +170,6 @@ extern char __etext;
 
 cf_log_level g_most_verbose_levels[CF_LOG_N_CONTEXTS];
 
-// OS related utility. TODO - should be in its own file?
-static bool g_use_group_perms = false;
-
 static bool g_use_local_time = false;
 static bool g_use_millis = false;
 
@@ -231,28 +231,6 @@ write_all(int fd, const char* buf, size_t sz)
 		buf += sz_wr;
 		sz -= (size_t)sz_wr;
 	}
-}
-
-
-//==========================================================
-// Public API - OS related utilities.
-// TODO - should be in their own file?
-//
-
-void
-cf_os_use_group_perms(bool use)
-{
-	g_use_group_perms = use;
-
-	if (use) {
-		umask((mode_t)S_IWOTH);
-	}
-}
-
-bool
-cf_os_is_using_group_perms(void)
-{
-	return g_use_group_perms;
 }
 
 
@@ -500,9 +478,7 @@ cf_log_rotate(void)
 
 		int old_fd = sink->fd;
 
-		// Note - we use O_TRUNC, so we assume the file has been moved/copied
-		// elsewhere, or we're ok losing it.
-		sink->fd = open(sink->path, CF_LOG_REOPEN_FLAGS, cf_os_log_perms());
+		sink->fd = open(sink->path, CF_LOG_OPEN_FLAGS, cf_os_log_perms());
 
 		usleep(1000); // threads may be interrupted while writing to old fd
 		close(old_fd);
@@ -772,6 +748,16 @@ log_write(cf_log_context context, cf_log_level level, const char* file_name,
 static int
 sprintf_now(char* buf)
 {
+	// Guard against reentrance since localtime_r() and gmtime_r() call
+	// allocation functions which may fail and write log lines.
+	static __thread bool g_reentrant = false;
+
+	if (g_reentrant) {
+		return 0;
+	}
+
+	g_reentrant = true;
+
 	struct timeval now_tv;
 	gettimeofday(&now_tv, NULL);
 
@@ -797,6 +783,8 @@ sprintf_now(char* buf)
 		strcpy(buf + pos, " GMT: ");
 		pos += 6;
 	}
+
+	g_reentrant = false;
 
 	return pos;
 }

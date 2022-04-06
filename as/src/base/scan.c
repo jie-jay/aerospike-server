@@ -1,7 +1,7 @@
 /*
  * scan.c
  *
- * Copyright (C) 2015-2020 Aerospike, Inc.
+ * Copyright (C) 2015-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -46,6 +46,7 @@
 #include "citrusleaf/cf_digest.h"
 #include "citrusleaf/cf_ll.h"
 
+#include "arenax.h"
 #include "cf_mutex.h"
 #include "cf_thread.h"
 #include "dynbuf.h"
@@ -66,9 +67,9 @@
 #include "base/security.h"
 #include "base/service.h"
 #include "base/set_index.h"
+#include "base/thr_query.h"
 #include "base/transaction.h"
 #include "fabric/partition.h"
-#include "sindex/secondary_index.h"
 #include "transaction/rw_utils.h"
 #include "transaction/udf.h"
 #include "transaction/write.h"
@@ -135,7 +136,7 @@ bool get_scan_sample_max(as_transaction* tr, uint64_t* sample_max);
 bool get_scan_rps(as_transaction* tr, uint32_t* rps);
 bool validate_background_scan_rps(const as_namespace* ns, uint32_t* rps);
 bool get_scan_socket_timeout(as_transaction* tr, uint32_t* timeout);
-bool get_scan_predexp(as_transaction* tr, as_exp** p_predexp);
+bool get_scan_filter_exp(as_transaction* tr, as_exp** exp);
 size_t send_blocking_response_chunk(as_file_handle* fd_h, uint8_t* buf, size_t size, int32_t timeout, bool compress, as_proto_comp_stat* comp_stat);
 static inline bool excluded_set(as_index* r, uint16_t set_id);
 
@@ -197,19 +198,10 @@ as_scan_limit_finished_jobs(void)
 	as_scan_manager_limit_finished_jobs();
 }
 
-int
+uint32_t
 as_scan_get_active_job_count(void)
 {
 	return as_scan_manager_get_active_job_count();
-}
-
-int
-as_scan_list(char* name, cf_dyn_buf* db)
-{
-	(void)name;
-
-	as_mon_info_cmd(AS_MON_MODULES[SCAN_MOD], NULL, 0, 0, db);
-	return 0;
 }
 
 as_mon_jobstat*
@@ -224,13 +216,13 @@ as_scan_get_jobstat_all(int* size)
 	return as_scan_manager_get_info(size);
 }
 
-int
+bool
 as_scan_abort(uint64_t trid)
 {
-	return as_scan_manager_abort_job(trid) ? 0 : -1;
+	return as_scan_manager_abort_job(trid);
 }
 
-int
+uint32_t
 as_scan_abort_all(void)
 {
 	return as_scan_manager_abort_all_jobs();
@@ -449,7 +441,7 @@ get_scan_socket_timeout(as_transaction* tr, uint32_t* timeout)
 }
 
 bool
-get_scan_predexp(as_transaction* tr, as_exp** p_predexp)
+get_scan_filter_exp(as_transaction* tr, as_exp** exp)
 {
 	if (! as_transaction_has_predexp(tr)) {
 		return true;
@@ -458,9 +450,9 @@ get_scan_predexp(as_transaction* tr, as_exp** p_predexp)
 	as_msg_field* f = as_msg_field_get(&tr->msgp->msg,
 			AS_MSG_FIELD_TYPE_PREDEXP);
 
-	*p_predexp = as_exp_filter_build(f, true);
+	*exp = as_exp_filter_build(f, true);
 
-	return *p_predexp != NULL;
+	return *exp != NULL;
 }
 
 size_t
@@ -644,7 +636,7 @@ typedef struct basic_scan_job_s {
 	bool			no_bin_data;
 	uint64_t		sample_max;
 	uint64_t		sample_count;
-	as_exp*			predexp;
+	as_exp*			filter_exp;
 	cf_vector*		bin_ids;
 } basic_scan_job;
 
@@ -667,7 +659,7 @@ typedef struct basic_scan_slice_s {
 } basic_scan_slice;
 
 bool basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata);
-bool basic_scan_predexp_filter_meta(const basic_scan_job* job, const as_record* r, as_exp** predexp);
+bool basic_scan_filter_meta(const basic_scan_job* job, const as_record* r, as_exp** exp);
 cf_vector* bin_ids_from_op(as_msg* m, as_namespace* ns, int* result);
 
 //----------------------------------------------------------
@@ -695,6 +687,11 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns)
 			! get_scan_rps(tr, &rps) ||
 			! get_scan_socket_timeout(tr, &timeout)) {
 		cf_warning(AS_SCAN, "basic scan job failed msg field processing");
+
+		if (pids != NULL) {
+			cf_free(pids);
+		}
+
 		return AS_ERR_PARAMETER;
 	}
 
@@ -703,10 +700,10 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns)
 		return AS_ERR_UNSUPPORTED_FEATURE;
 	}
 
-	as_exp* predexp = NULL;
+	as_exp* filter_exp = NULL;
 
-	if (! get_scan_predexp(tr, &predexp)) {
-		cf_warning(AS_SCAN, "basic scan job failed predexp processing");
+	if (! get_scan_filter_exp(tr, &filter_exp)) {
+		cf_warning(AS_SCAN, "basic scan job failed filter processing");
 		cf_free(pids);
 		return AS_ERR_PARAMETER;
 	}
@@ -717,7 +714,7 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns)
 
 	if (result != AS_OK) {
 		cf_warning(AS_SCAN, "basic scan job failed quota %d", result);
-		as_exp_destroy(predexp);
+		as_exp_destroy(filter_exp);
 		cf_free(pids);
 		return result;
 	}
@@ -734,7 +731,7 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns)
 	job->no_bin_data = (tr->msgp->msg.info1 & AS_MSG_INFO1_GET_NO_BINS) != 0;
 	job->sample_max = sample_max;
 	job->sample_count = 0;
-	job->predexp = predexp;
+	job->filter_exp = filter_exp;
 	job->bin_ids = bin_ids_from_op(&tr->msgp->msg, ns, &result);
 
 	if (result != AS_OK) {
@@ -860,7 +857,7 @@ basic_scan_job_destroy(as_scan_job* _job)
 		cf_vector_destroy(job->bin_ids);
 	}
 
-	as_exp_destroy(job->predexp);
+	as_exp_destroy(job->filter_exp);
 }
 
 void
@@ -894,9 +891,9 @@ basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 		return true;
 	}
 
-	as_exp* predexp = NULL;
+	as_exp* filter_exp = NULL;
 
-	if (! basic_scan_predexp_filter_meta(job, r, &predexp)) {
+	if (! basic_scan_filter_meta(job, r, &filter_exp)) {
 		as_record_done(r_ref, ns);
 		as_incr_uint64(&_job->n_filtered_meta);
 		return true;
@@ -906,7 +903,7 @@ basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 
 	as_storage_record_open(ns, r, &rd);
 
-	if (predexp != NULL && predexp_read_and_filter_bins(&rd, predexp) != 0) {
+	if (filter_exp != NULL && read_and_filter_bins(&rd, filter_exp) != 0) {
 		as_storage_record_close(&rd);
 		as_record_done(r_ref, ns);
 		as_incr_uint64(&_job->n_filtered_bins);
@@ -979,27 +976,27 @@ basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 }
 
 bool
-basic_scan_predexp_filter_meta(const basic_scan_job* job, const as_record* r,
-		as_exp** predexp)
+basic_scan_filter_meta(const basic_scan_job* job, const as_record* r,
+		as_exp** exp)
 {
-	*predexp = job->predexp;
+	*exp = job->filter_exp;
 
-	if (*predexp == NULL) {
+	if (*exp == NULL) {
 		return true;
 	}
 
 	as_namespace* ns = ((as_scan_job*)job)->ns;
-	as_exp_ctx predargs = { .ns = ns, .r = (as_record*)r };
-	as_exp_trilean predrv = as_exp_matches_metadata(*predexp, &predargs);
+	as_exp_ctx ctx = { .ns = ns, .r = (as_record*)r };
+	as_exp_trilean tv = as_exp_matches_metadata(*exp, &ctx);
 
-	if (predrv == AS_EXP_UNK) {
-		return true; // caller must later check bins using *predexp
+	if (tv == AS_EXP_UNK) {
+		return true; // caller must later check bins using *exp
 	}
 	// else - caller will not need to apply filter later.
 
-	*predexp = NULL;
+	*exp = NULL;
 
-	return predrv == AS_EXP_TRUE;
+	return tv == AS_EXP_TRUE;
 }
 
 cf_vector*
@@ -1019,7 +1016,7 @@ bin_ids_from_op(as_msg* m, as_namespace* ns, int* result)
 	cf_vector* id_vec  = cf_vector_create(sizeof(uint16_t), m->n_ops, 0);
 
 	as_msg_op* op = NULL;
-	int n = 0;
+	uint16_t n = 0;
 
 	while ((op = as_msg_op_iterate(m, op, &n)) != NULL) {
 		uint16_t id;
@@ -1078,21 +1075,20 @@ typedef struct aggr_scan_slice_s {
 
 bool aggr_scan_init(as_aggr_call* call, const as_transaction* tr);
 bool aggr_scan_job_reduce_cb(as_index_ref* r_ref, void* udata);
-bool aggr_scan_add_digest(cf_ll* ll, cf_digest* keyd);
+bool aggr_scan_add_digest(const as_namespace* ns, cf_ll* ll, as_index* r, cf_arenax_handle r_h);
 as_partition_reservation* aggr_scan_ptn_reserve(void* udata, as_namespace* ns,
 		uint32_t pid, as_partition_reservation* rsv);
 as_stream_status aggr_scan_ostream_write(void* udata, as_val* val);
+void aggr_scan_add_val_response(aggr_scan_slice* slice, const as_val* val,
+		bool success);
+int aggr_scan_release_cb(cf_ll_element* ele, void* udata);
 
 const as_aggr_hooks scan_aggr_hooks = {
 	.ostream_write = aggr_scan_ostream_write,
-	.set_error     = NULL,
 	.ptn_reserve   = aggr_scan_ptn_reserve,
 	.ptn_release   = NULL,
 	.pre_check     = NULL
 };
-
-void aggr_scan_add_val_response(aggr_scan_slice* slice, const as_val* val,
-		bool success);
 
 //----------------------------------------------------------
 // aggr_scan_job public API.
@@ -1231,7 +1227,7 @@ aggr_scan_job_slice(as_scan_job* _job, as_partition_reservation* rsv,
 		as_result_destroy(&result);
 	}
 
-	cf_ll_reduce(&ll, true, as_index_keys_ll_reduce_fn, NULL);
+	cf_ll_reduce(&ll, true, aggr_scan_release_cb, rsv);
 
 	if (bb->used_sz > sizeof(as_proto)) {
 		conn_scan_job_send_response((conn_scan_job*)job, bb->buf, bb->used_sz);
@@ -1324,7 +1320,7 @@ aggr_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 		return true;
 	}
 
-	if (! aggr_scan_add_digest(slice->ll, &r->keyd)) {
+	if (! aggr_scan_add_digest(ns, slice->ll, r, r_ref->r_h)) {
 		as_record_done(r_ref, ns);
 		as_scan_manager_abandon_job(_job, AS_ERR_UNKNOWN);
 		return false;
@@ -1339,12 +1335,13 @@ aggr_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 }
 
 bool
-aggr_scan_add_digest(cf_ll* ll, cf_digest* keyd)
+aggr_scan_add_digest(const as_namespace* ns, cf_ll* ll, as_index* r,
+		cf_arenax_handle r_h)
 {
 	as_index_keys_ll_element* tail_e = (as_index_keys_ll_element*)ll->tail;
 	as_index_keys_arr* keys_arr;
 
-	if (tail_e) {
+	if (tail_e != NULL) {
 		keys_arr = tail_e->keys_arr;
 
 		if (keys_arr->num == AS_INDEX_KEYS_PER_ARR) {
@@ -1352,18 +1349,26 @@ aggr_scan_add_digest(cf_ll* ll, cf_digest* keyd)
 		}
 	}
 
-	if (! tail_e) {
-		if (! (keys_arr = as_index_get_keys_arr())) {
-			return false;
-		}
+	if (tail_e == NULL) {
+		keys_arr = cf_malloc(sizeof(as_index_keys_arr));
+		keys_arr->num = 0;
 
 		tail_e = cf_malloc(sizeof(as_index_keys_ll_element));
-
 		tail_e->keys_arr = keys_arr;
+
 		cf_ll_append(ll, (cf_ll_element*)tail_e);
 	}
 
-	keys_arr->pindex_digs[keys_arr->num] = *keyd;
+	// TODO - proper EE split.
+	if (ns->xmem_type == CF_XMEM_TYPE_FLASH) {
+		keys_arr->u.digests[keys_arr->num] = r->keyd;
+	}
+	else {
+		as_index_reserve(r);
+
+		keys_arr->u.handles[keys_arr->num] = (uint64_t)r_h;
+	}
+
 	keys_arr->num++;
 
 	return true;
@@ -1414,6 +1419,35 @@ aggr_scan_add_val_response(aggr_scan_slice* slice, const as_val* val,
 	}
 }
 
+int
+aggr_scan_release_cb(cf_ll_element* ele, void* udata)
+{
+	as_partition_reservation* rsv = udata;
+	as_namespace* ns = rsv->ns;
+
+	// TODO - proper EE split.
+	if (ns->xmem_type == CF_XMEM_TYPE_FLASH) {
+		return CF_LL_REDUCE_DELETE;
+	}
+
+	as_index_tree* tree = rsv->tree;
+	as_index_keys_ll_element* node = (as_index_keys_ll_element*)ele;
+	as_index_keys_arr* k_a = node->keys_arr;
+
+	for (uint32_t i = 0; i < k_a->num; i++) {
+		cf_arenax_handle r_h = k_a->u.handles[i];
+
+		as_record* r = cf_arenax_resolve(ns->arena, r_h);
+		as_index_ref r_ref = { .r = r, .r_h = r_h };
+
+		as_index_vlock(tree, &r_ref);
+
+		as_index_release(r);
+		as_record_done(&r_ref, ns);
+	}
+
+	return CF_LL_REDUCE_DELETE;
+}
 
 
 //==============================================================================
@@ -1479,10 +1513,10 @@ udf_bg_scan_job_start(as_transaction* tr, as_namespace* ns)
 		return AS_ERR_PARAMETER;
 	}
 
-	as_exp* predexp = NULL;
+	as_exp* filter_exp = NULL;
 
-	if (! get_scan_predexp(tr, &predexp)) {
-		cf_warning(AS_SCAN, "udf-bg scan job failed predexp processing");
+	if (! get_scan_filter_exp(tr, &filter_exp)) {
+		cf_warning(AS_SCAN, "udf-bg scan job failed filter processing");
 		return AS_ERR_PARAMETER;
 	}
 
@@ -1492,7 +1526,7 @@ udf_bg_scan_job_start(as_transaction* tr, as_namespace* ns)
 
 	if (result != AS_OK) {
 		cf_warning(AS_SCAN, "udf-bg scan job failed quota %d", result);
-		as_exp_destroy(predexp);
+		as_exp_destroy(filter_exp);
 		return result;
 	}
 
@@ -1505,7 +1539,7 @@ udf_bg_scan_job_start(as_transaction* tr, as_namespace* ns)
 
 	job->n_active_tr = 0;
 
-	job->origin.predexp = predexp; // first, so it's destroyed on failures
+	job->origin.filter_exp = filter_exp; // first, so it's destroyed on failures
 
 	if (! udf_def_init_from_msg(&job->origin.def, tr)) {
 		cf_warning(AS_SCAN, "udf-bg scan job failed def init");
@@ -1636,10 +1670,10 @@ udf_bg_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 		return true;
 	}
 
-	as_exp_ctx predargs = { .ns = ns, .r = r };
+	as_exp_ctx ctx = { .ns = ns, .r = r };
 
-	if (job->origin.predexp != NULL &&
-			as_exp_matches_metadata(job->origin.predexp, &predargs) ==
+	if (job->origin.filter_exp != NULL &&
+			as_exp_matches_metadata(job->origin.filter_exp, &ctx) ==
 					AS_EXP_FALSE) {
 		as_record_done(r_ref, ns);
 		as_incr_uint64(&_job->n_filtered_meta);
@@ -1752,10 +1786,10 @@ ops_bg_scan_job_start(as_transaction* tr, as_namespace* ns)
 		return AS_ERR_PARAMETER;
 	}
 
-	as_exp* predexp = NULL;
+	as_exp* filter_exp = NULL;
 
-	if (! get_scan_predexp(tr, &predexp)) {
-		cf_warning(AS_SCAN, "ops-bg scan job failed get predexp");
+	if (! get_scan_filter_exp(tr, &filter_exp)) {
+		cf_warning(AS_SCAN, "ops-bg scan job failed filter processing");
 		return AS_ERR_PARAMETER;
 	}
 
@@ -1765,7 +1799,7 @@ ops_bg_scan_job_start(as_transaction* tr, as_namespace* ns)
 
 	if (ops == NULL) {
 		cf_warning(AS_SCAN, "ops-bg scan job failed get ops");
-		as_exp_destroy(predexp);
+		as_exp_destroy(filter_exp);
 		return AS_ERR_PARAMETER;
 	}
 
@@ -1776,7 +1810,7 @@ ops_bg_scan_job_start(as_transaction* tr, as_namespace* ns)
 	if (result != AS_OK) {
 		cf_warning(AS_SCAN, "ops-bg scan job failed quota %d", result);
 		iops_expops_destroy(expops, om->n_ops);
-		as_exp_destroy(predexp);
+		as_exp_destroy(filter_exp);
 		return result;
 	}
 
@@ -1798,7 +1832,7 @@ ops_bg_scan_job_start(as_transaction* tr, as_namespace* ns)
 			om->record_ttl, om->n_ops, ops,
 			tr->msgp->proto.sz - (ops - (uint8_t*)om));
 
-	job->origin.predexp = predexp;
+	job->origin.filter_exp = filter_exp;
 	job->origin.expops = expops;
 
 	job->origin.cb = ops_bg_scan_tr_complete;
@@ -1911,7 +1945,7 @@ ops_bg_scan_get_ops(const as_msg* m, iops_expop** p_expops)
 
 	as_msg_op* op = NULL;
 	uint8_t* first = NULL;
-	int i = 0;
+	uint16_t i = 0;
 	bool has_expop = false;
 
 	while ((op = as_msg_op_iterate(m, op, &i)) != NULL) {
@@ -1973,10 +2007,10 @@ ops_bg_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 		return true;
 	}
 
-	as_exp_ctx predargs = { .ns = ns, .r = r };
+	as_exp_ctx ctx = { .ns = ns, .r = r };
 
-	if (job->origin.predexp != NULL &&
-			as_exp_matches_metadata(job->origin.predexp, &predargs) ==
+	if (job->origin.filter_exp != NULL &&
+			as_exp_matches_metadata(job->origin.filter_exp, &ctx) ==
 					AS_EXP_FALSE) {
 		as_record_done(r_ref, ns);
 		as_incr_uint64(&_job->n_filtered_meta);
